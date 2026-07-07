@@ -86,9 +86,13 @@ fi
 
 if [ "$HAVE_JVM" = 1 ]; then
     mkdir -p "$OUT/classes"
-    # Only the Bench* baselines — other harness files (VerifyJVector) need
-    # jars we don't classpath here, and one failing file aborts javac.
-    "$JAVAC" -cp "$JAR" -d "$OUT/classes" harness/src/Bench*.java 2>"$OUT/javac.log" \
+    # Only the Bench* baselines that need just the Lucene jar. Exclude
+    # BenchVectorSearch (imports jVector — compiled separately by the
+    # vector_search cargo bench with the jVector classpath) and, like
+    # VerifyJVector, kept off this classpath; one failing file aborts javac.
+    BASELINES=$(ls harness/src/Bench*.java | grep -v 'BenchVectorSearch\.java')
+    # shellcheck disable=SC2086
+    "$JAVAC" -cp "$JAR" -d "$OUT/classes" $BASELINES 2>"$OUT/javac.log" \
         || echo "  (javac failed — see $OUT/javac.log; jvm rows will skip)"
 
     # BenchIngest both *generates* the numeric index and *is* the write baseline.
