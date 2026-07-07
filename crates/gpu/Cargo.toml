@@ -1,0 +1,87 @@
+[package]
+name = "lucene-arrow-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Builds as an empty crate without `gpu` so the workspace never requires
+# CUDA (SPEC §3.5). With `gpu`, kernels are NVRTC-compiled at runtime and
+# libcuda/libnvrtc are dlopen'd (no build-time CUDA toolchain coupling).
+default = []
+gpu = ["dep:cudarc", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema", "dep:lucene-arrow-vectors"]
+# cuVS-backed ANN (CAGRA / brute force) — needs the pixi env (SPEC §3.7):
+#   CONDA_PREFIX=$PWD/.pixi/envs/default cargo build --features gpu,cuvs
+cuvs = ["gpu", "dep:cuvs", "dep:cuvs-sys", "dep:ndarray"]
+
+[dependencies]
+lucene-arrow-postings = { path = "../postings" }
+hashbrown = "0.15"
+lucene-arrow-core = { workspace = true }
+lucene-arrow-docvalues = { workspace = true }
+lucene-arrow-vectors = { workspace = true, optional = true }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12090"], optional = true }
+cuvs = { version = "26.6", optional = true }
+cuvs-sys = { version = "26.6", optional = true }
+ndarray = { version = "0.15", optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+
+[dev-dependencies]
+lucene-arrow-cpu = { workspace = true }
+lucene-arrow-codec = { workspace = true }
+lucene-arrow-vectors = { workspace = true }
+tempfile = "3"
+bearing = { workspace = true }
+
+[[bench]]
+name = "gpu_decode"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "e2e_decode"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "knn_scale"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "scan_dir"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_encode"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "knn_threeway"
+harness = false
+required-features = ["cuvs"]
+
+[[bench]]
+name = "hnsw_build"
+harness = false
+required-features = ["cuvs"]
+
+[[bench]]
+name = "postings_gpu"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "bm25_query"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_ingest"
+harness = false
+required-features = ["gpu"]
