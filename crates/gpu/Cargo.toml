@@ -85,3 +85,8 @@ required-features = ["gpu"]
 name = "gpu_ingest"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "vector_search"
+harness = false
+required-features = ["cuvs"]

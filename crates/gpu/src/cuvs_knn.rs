@@ -167,6 +167,61 @@ impl CuvsContext {
         Ok((graph_host.into_raw_vec(), build))
     }
 
+    /// Build a CAGRA index and return its **search-optimized** graph as a
+    /// host `n × degree` adjacency (row-major u32) + the actual degree.
+    /// This is cuVS's proper "kNN graph → navigable search graph" pass
+    /// (prunes redundant edges, adds diversity, shrinks diameter) — the
+    /// right input for the Lucene/jVector serializers, versus the raw
+    /// NN-Descent graph + a hand-rolled ring, which does not scale.
+    pub fn cagra_graph(
+        &self,
+        vectors: &[f32],
+        dim: usize,
+        degree: usize,
+    ) -> Result<(Vec<u32>, usize)> {
+        use cuvs_sys as ffi;
+        let n = vectors.len() / dim;
+        let dataset = ndarray::Array2::from_shape_vec((n, dim), vectors.to_vec())
+            .map_err(|e| Error::invalid(e.to_string()))?;
+        let dataset_dev = ManagedTensor::from(&dataset).to_device(&self.res).map_err(cuvs_err)?;
+
+        // Safety: C API with valid handles. The graph is copied to host via
+        // cuVS's own context-correct `cuvsMatrixCopy` before the index (which
+        // owns the device memory) is destroyed.
+        unsafe {
+            let mut params: ffi::cuvsCagraIndexParams_t = std::ptr::null_mut();
+            check(ffi::cuvsCagraIndexParamsCreate(&mut params))?;
+            (*params).graph_degree = degree;
+            (*params).intermediate_graph_degree =
+                (degree * 2).max((*params).intermediate_graph_degree);
+            let mut index: ffi::cuvsCagraIndex_t = std::ptr::null_mut();
+            check(ffi::cuvsCagraIndexCreate(&mut index))?;
+            let rc = ffi::cuvsCagraBuild(self.res.0, params, dataset_dev.as_ptr(), index);
+            let result = (|| {
+                check(rc)?;
+                // GetGraph populates the descriptor; zero-init is invalid
+                // (DLPack enums have no zero variant), so MaybeUninit it.
+                let mut src = std::mem::MaybeUninit::<ffi::DLManagedTensor>::zeroed();
+                check(ffi::cuvsCagraIndexGetGraph(index, src.as_mut_ptr()))?;
+                let mut src = src.assume_init();
+                let rows = *src.dl_tensor.shape as usize;
+                let cols = *src.dl_tensor.shape.add(1) as usize;
+                let mut host = vec![0u32; rows * cols];
+                let mut dst = src;
+                dst.dl_tensor.data = host.as_mut_ptr() as *mut std::os::raw::c_void;
+                dst.dl_tensor.device.device_type = ffi::DLDeviceType::kDLCPU;
+                dst.dl_tensor.device.device_id = 0;
+                dst.deleter = None;
+                check(ffi::cuvsMatrixCopy(self.res.0, &mut src, &mut dst))?;
+                check(ffi::cuvsStreamSync(self.res.0))?; // copy is stream-ordered
+                Ok((host, cols))
+            })();
+            let _ = ffi::cuvsCagraIndexDestroy(index);
+            let _ = ffi::cuvsCagraIndexParamsDestroy(params);
+            result
+        }
+    }
+
     fn search_common(
         &self,
         nq: usize,

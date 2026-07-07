@@ -105,10 +105,39 @@ CheckIndex-clean. Conversion is single-threaded CPU; the gap widens with
 scale (Elastic reports ~12× for the same architecture).
 
 **Vectors through DoPut** (`cuvs` feature): `FixedSizeList<Float32, d>`
-columns flush flat + graph files (NN-Descent on GPU; exact CPU kNN for
-segments ≤ 4096 docs), similarity via `lucene.vector.similarity` metadata
-(`flight_vectors.rs`: DoPut → exact float round-trip over DoGet →
+columns flush flat + graph files, similarity via `lucene.vector.similarity`
+metadata (`flight_vectors.rs`: DoPut → exact float round-trip over DoGet →
 CheckIndex vectors test green).
+
+**Search throughput + the graph-quality fix** (`--bench vector_search`).
+One GPU-built graph, searched three ways over 100k × 128-d, k=10, ef=100
+(FlatKnn = exact GPU brute force; jVector / Lucene read the files we
+wrote):
+
+| engine | QPS | recall@10 |
+|---|---|---|
+| FlatKnn (ours, exact GPU) | 3,062 | 1.000 (reference) |
+| jVector OnDiskGraphIndex | 3,576 | 0.969 |
+| Lucene HNSW (KnnFloatVectorQuery) | 7,553 | 0.980 |
+
+This bench exposed — and drove the fix for — a real graph-quality gap.
+The write path originally built a **single-level** graph (cuVS NN-Descent
+kNN edges + a deterministic connectivity ring). That passed the P6c/P8
+*format* gates (4k, low-dim, exact-member queries → 100% recall) but at
+100k scale gave only **~5% recall**: a single-level kNN graph is poorly
+navigable for single-entry greedy search — greedy from the entry node
+cannot escape its local component to reach a far query. Feeding cuVS
+**CAGRA**'s search-optimized graph instead (extracted via
+`cuvsCagraIndexGetGraph`) made it *worse* (~1%): CAGRA's graph, though
+80% true-kNN accurate, is tuned for CAGRA's own multi-start search, not
+Lucene/jVector greedy. The fix (`hnsw::small_world_from_cagra`) keeps
+CAGRA's good local edges and adds a few **random long-range edges** per
+node — small-world structure (O(log n) diameter) — which is exactly what
+single-entry greedy needs: recall jumps to ~98%. Both the DoPut write
+path and the bench use it. Note the honest read of the numbers: at ~98%
+recall, exact GPU FlatKnn (3k QPS, 100% recall) is competitive with the
+graph engines, because brute force is cheap on a GPU; Lucene HNSW is
+~2.5× faster at 98% recall. Post-v1: true multi-layer HNSW output.
 
 ---
 

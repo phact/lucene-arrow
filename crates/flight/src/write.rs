@@ -787,8 +787,11 @@ fn build_graph(data: &[f32], dim: usize) -> Result<Vec<Vec<u32>>> {
     {
         let ctx = lucene_arrow_gpu::cuvs_knn::CuvsContext::new()
             .map_err(|e| Error::invalid(format!("vector ingest needs a GPU at this size: {e}")))?;
-        let (graph, _t) = ctx.knn_graph(data, dim, degree)?;
-        Ok(lucene_arrow_vectors::hnsw::navigable_from_knn(&graph, n, degree, degree))
+        // CAGRA's search-optimized graph + small-world augmentation — the
+        // combination that gives Lucene/jVector greedy search real recall
+        // at scale (a raw kNN graph does not; see vectors::hnsw).
+        let (graph, gdeg) = ctx.cagra_graph(data, dim, degree)?;
+        Ok(lucene_arrow_vectors::hnsw::small_world_from_cagra(&graph, n, gdeg, degree))
     }
     #[cfg(not(feature = "cuvs"))]
     Err(Error::invalid("vector ingest needs the cuvs build for segments > 4096 docs"))
