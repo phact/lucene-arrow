@@ -363,10 +363,24 @@ bswap → host floats) is ~3.5 s warm / ~10 s cold, and the host
 raw file bytes and byte-swaps the strided BE f32 vectors into a
 contiguous **device** buffer, handed straight to
 `CuvsContext::cagra_to_hnswlib_device` (no host float buffer, no
-round-trip) — runs the whole merge **2.18× faster** (44.8 s → 20.6 s).
-cudarc and cuVS share the CUDA primary context, so the device pointer
-crosses libraries directly. Gate `p_fused_extract`: the GPU gather is
-byte-identical to the CPU reader and the device-fed graph searches top-1
-exact in the real jVector library. Headroom: pinned-staging upload (the
-gather is currently pageable-upload-bound) and GPUDirect Storage to skip
-the CPU on the read path entirely.
+round-trip). cudarc and cuVS share the CUDA primary context, so the
+device pointer crosses libraries directly. Gate `p_fused_extract`: the
+GPU gather is byte-identical to the CPU reader and the device-fed graph
+searches top-1 exact in the real jVector library.
+
+The gather uploads through a **cacheable pinned ring** (32 MB × 4,
+copy/DMA overlap — the same path as the decode uploader), so the extract
+runs at **15 GB/s** (0.82 s for 12.3 GB) vs the CPU read's ~3.9 s — a
+**4.8×** extract speedup, near PCIe line rate. Honest Amdahl, though: at
+this scale the *merge is CAGRA-build-bound* (~30 s of the ~32 s), so the
+extract is now only ~2.5% of the wall and the fused-vs-host *merge* ratio
+is a modest ~1.2× — and noisy, because the CAGRA build itself varies
+17–34 s run-to-run (GPU boost/thermal on back-to-back builds). The solid,
+reproducible win is the extract (4.8×, no host round-trip); shaving the
+merge further means faster graph *construction*, not extraction.
+
+GPUDirect Storage (NVMe→VRAM, no CPU) was tested with NVIDIA `gdscheck`
+and is **Unsupported** on this box: consumer GeForce reports
+`NVMe P2PDMA: Unsupported`, so cuFile only offers host-bounce
+compatibility mode (no benefit). libcufile + ext4/NVMe are fine; the
+P2PDMA capability is the gate. So pinned staging is the ceiling here.

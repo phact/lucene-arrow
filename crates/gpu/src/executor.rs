@@ -141,6 +141,11 @@ pub(crate) fn cuda_err(e: impl std::fmt::Display) -> Error {
     Error::Codec(format!("cuda: {e}"))
 }
 
+/// Pinned staging ring geometry for bulk uploads (32 MB × 4, matching the
+/// decode path): copy/DMA overlap at PCIe line rate.
+const PIN_CHUNK: usize = 32 << 20;
+const PIN_DEPTH: usize = 4;
+
 impl GpuDecoder {
     /// Fails cleanly when no CUDA device/driver is present — callers use
     /// that as the "skip GPU path" signal (SPEC §3.5).
@@ -169,7 +174,11 @@ impl GpuDecoder {
         dim: usize,
         n: usize,
     ) -> Result<cudarc::driver::CudaSlice<f32>> {
-        let d_raw = self.upload(raw)?;
+        // Pinned-ring upload (cacheable page-locked, copy/DMA overlap) — the
+        // raw bytes are the transfer bottleneck, so never go through pageable
+        // memory (SPEC §11.2).
+        let ring = self.new_pinned_ring(PIN_CHUNK, PIN_DEPTH)?;
+        let d_raw = self.upload_pipelined(raw, &ring)?;
         let total = n * dim;
         let mut out = self.stream.alloc_zeros::<f32>(total.max(1)).map_err(cuda_err)?;
         let block = 256u32;
@@ -202,9 +211,10 @@ impl GpuDecoder {
     ) -> Result<cudarc::driver::CudaSlice<f32>> {
         let total: usize = files.iter().map(|&(_, _, _, n)| n * dim).sum();
         let mut combined = self.stream.alloc_zeros::<f32>(total.max(1)).map_err(cuda_err)?;
+        let ring = self.new_pinned_ring(PIN_CHUNK, PIN_DEPTH)?; // reused across files
         let mut off = 0usize;
         for &(raw, header, record, n) in files {
-            let d_raw = self.upload(raw)?;
+            let d_raw = self.upload_pipelined(raw, &ring)?;
             let cnt = n * dim;
             let block = 256u32;
             let grid = ((cnt as u64).div_ceil(block as u64) as u32).clamp(1, 65_535);
