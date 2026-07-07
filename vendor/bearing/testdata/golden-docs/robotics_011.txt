@@ -1,0 +1,1 @@
+Robotic systems integrate sensors and actuators for autonomous control. Parallel processing divides work across multiple computational units. Machine learning models train on labeled data to make predictions.

@@ -1,0 +1,1 @@
+Compilers transform source code into executable machine instructions. Type systems prevent entire classes of programming errors at compile time.

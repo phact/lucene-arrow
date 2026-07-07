@@ -1,0 +1,1 @@
+Computational biology models protein folding and gene expression. Performance optimization requires careful profiling and measurement. Version control systems track changes to source code over time. Distributed systems coordinate multiple processes across network boundaries.

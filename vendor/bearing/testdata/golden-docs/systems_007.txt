@@ -1,0 +1,1 @@
+Operating systems manage hardware resources and process scheduling. Distributed systems coordinate multiple processes across network boundaries. Version control systems track changes to source code over time.

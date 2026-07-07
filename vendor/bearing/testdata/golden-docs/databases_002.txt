@@ -1,0 +1,1 @@
+Relational databases use SQL to query and manipulate structured data. Parallel processing divides work across multiple computational units. Container orchestration automates deployment and scaling of applications. Machine learning models train on labeled data to make predictions.

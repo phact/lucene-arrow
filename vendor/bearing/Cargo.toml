@@ -1,0 +1,57 @@
+[package]
+name = "bearing"
+version = "0.1.0-alpha.5"
+edition = "2024"
+description = "A Rust port of Apache Lucene"
+license = "Apache-2.0"
+documentation = "https://docs.rs/bearing"
+repository = "https://github.com/toddfeak/bearing"
+homepage = "https://github.com/toddfeak/bearing"
+readme = "README.md"
+keywords = ["lucene", "search", "indexing", "full-text-search"]
+categories = ["text-processing"]
+rust-version = "1.88"
+include = ["/src/", "/tests/*.rs", "/Cargo.toml", "/LICENSE", "/NOTICE", "/README.md", "/CONTRIBUTING.md", "/CHANGELOG.md"]
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:jemallocator"]
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+crossbeam-channel = "0.5"
+jemallocator = { version = "0.5", optional = true }
+fixedbitset = "0.5"
+log = "0.4"
+mem_dbg = "0.4.1"
+memmap2 = "0.9.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simple_logger = { version = "5.2", default-features = false }
+unicode-segmentation = "1.13"
+utf8-zero = "0.8.1"
+
+[dev-dependencies]
+assertables = "9.8.6"
+tempfile = "3.27.0"
+
+[[bin]]
+name = "indexfiles"
+path = "src/bin/indexfiles.rs"
+
+[[bin]]
+name = "generate_summary"
+path = "src/bin/generate_summary.rs"
+
+[[bin]]
+name = "queryindex"
+path = "src/bin/queryindex.rs"

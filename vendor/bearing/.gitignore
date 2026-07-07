@@ -1,0 +1,20 @@
+# Claude
+.claude/
+
+# Rust
+/target/
+
+# Reference sources (downloaded by reference/download-references.sh)
+/reference/lucene-*/
+/reference/assertables/
+
+# Gradle (Java test utilities)
+tests/java/.*
+tests/java/bin/
+tests/java/build/
+
+# JetBrains IDE (keep project files, exclude user-specific state)
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+.idea/dictionaries/

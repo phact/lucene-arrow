@@ -1,0 +1,1 @@
+Sorting algorithms provide efficient ways to organize data structures. Performance optimization requires careful profiling and measurement. Cache hierarchies reduce memory access latency in modern processors. Functional programming emphasizes immutable data and pure functions. Distributed systems coordinate multiple processes across network boundaries.

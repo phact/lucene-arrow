@@ -1,0 +1,1 @@
+Natural language processing enables machines to understand human text. Distributed systems coordinate multiple processes across network boundaries. Container orchestration automates deployment and scaling of applications. Parallel processing divides work across multiple computational units.

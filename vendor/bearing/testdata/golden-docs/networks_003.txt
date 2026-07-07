@@ -1,0 +1,1 @@
+Computer networks transmit packets across routers and switches. Distributed systems coordinate multiple processes across network boundaries. Container orchestration automates deployment and scaling of applications. Cache hierarchies reduce memory access latency in modern processors.

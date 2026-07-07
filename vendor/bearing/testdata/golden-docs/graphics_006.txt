@@ -1,0 +1,1 @@
+Rendering engines process vertices and fragments for display output. Parallel processing divides work across multiple computational units. Type systems prevent entire classes of programming errors at compile time. Machine learning models train on labeled data to make predictions. Distributed systems coordinate multiple processes across network boundaries.
