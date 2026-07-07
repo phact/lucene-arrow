@@ -1,0 +1,21 @@
+[package]
+name = "lucene-arrow-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lucene-arrow-core = { workspace = true }
+bearing = { workspace = true }
+lucene-arrow-docvalues = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+lucene-arrow-docvalues = { workspace = true }
+lucene-arrow-cpu = { workspace = true }
+lucene-arrow-vectors = { workspace = true }
+arrow-array = { workspace = true }
+serde_json = { workspace = true }
