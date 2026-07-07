@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Three-way vector-search throughput over ONE GPU-built graph: our exact
-//! GPU FlatKnn (Rust) vs jVector `OnDiskGraphIndex` and Lucene HNSW
-//! (Java, reading the files we wrote). Reports QPS + recall@k against the
-//! FlatKnn exact top-k. Node/doc ids share the ordinal space, so recall
-//! is directly comparable.
+//! Vector-search throughput + recall on ONE dataset, five ways: our exact
+//! GPU FlatKnn (Rust); jVector and Lucene HNSW reading the graph *we*
+//! wrote; and jVector and Lucene searching graphs built by their *own*
+//! native builders. The native rows isolate graph quality — is our graph
+//! bad in general, or bad for a specific engine? (Answer: our
+//! CAGRA + random-shortcut graph is ~3-5x worse than both native builders
+//! on speed and recall — proper diversity pruning + hierarchy wins.)
+//! Ground-truth top-k is the FlatKnn exact result; node/doc ids share the
+//! ordinal space, so recall is directly comparable.
 //!
 //! Run: CONDA_PREFIX=... PATH=...pixi.../bin:$PATH LD_LIBRARY_PATH=...pixi.../lib \
 //!      cargo bench -p lucene-arrow-gpu --features cuvs --bench vector_search
@@ -140,13 +144,16 @@ fn main() {
         .unwrap();
     let gtbin = tmp.path().join("gt.bin");
     std::fs::write(&gtbin, gt.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    // Raw dataset too, so Java can build each engine's native graph.
+    let vbin = tmp.path().join("vectors.bin");
+    std::fs::write(&vbin, &payload).unwrap();
 
     // Java: jVector + Lucene HNSW search over the files we wrote.
     let java = std::path::Path::new("/home/tato/.jbang/cache/jdks/21/bin/java");
     let harness = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness");
     if !java.exists() {
         eprintln!("no JDK 21 — printing FlatKnn only");
-        print_table(flat_qps, None, None);
+        print_table(flat_qps, None, None, None, None);
         return;
     }
     let cp = [
@@ -172,7 +179,7 @@ fn main() {
         .unwrap_or(false);
     if !ok {
         eprintln!("javac failed — printing FlatKnn only");
-        print_table(flat_qps, None, None);
+        print_table(flat_qps, None, None, None, None);
         return;
     }
     let out = std::process::Command::new(java)
@@ -184,35 +191,48 @@ fn main() {
         .arg(&qbin)
         .arg(&gtbin)
         .args([&DIM.to_string(), &K.to_string(), &EF.to_string()])
+        .arg(&vbin)
         .output()
         .unwrap();
     if !out.status.success() {
         eprintln!("BenchVectorSearch failed:\n{}", String::from_utf8_lossy(&out.stderr));
-        print_table(flat_qps, None, None);
+        print_table(flat_qps, None, None, None, None);
         return;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let row = |name: &str| -> Option<(f64, f64)> {
-        stdout.lines().find(|l| l.starts_with(name)).and_then(|l| {
+        stdout.lines().find(|l| l.split(',').next() == Some(name)).and_then(|l| {
             let mut p = l.split(',').skip(1);
             Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?))
         })
     };
-    print_table(flat_qps, row("jvector"), row("lucene_hnsw"));
+    print_table(
+        flat_qps,
+        row("jvector"),
+        row("lucene_hnsw"),
+        row("jvector_native"),
+        row("lucene_native"),
+    );
 }
 
-fn print_table(flat_qps: f64, jvector: Option<(f64, f64)>, lucene: Option<(f64, f64)>) {
+fn print_table(
+    flat_qps: f64,
+    jvector: Option<(f64, f64)>,
+    lucene: Option<(f64, f64)>,
+    jvector_native: Option<(f64, f64)>,
+    lucene_native: Option<(f64, f64)>,
+) {
+    let line = |name: &str, v: Option<(f64, f64)>| match v {
+        Some((qps, r)) => println!("  {name:<30} | {qps:>6.0} | {r:>8.3}"),
+        None => println!("  {name:<30} |      - |        -"),
+    };
     println!();
     println!("{N} × {DIM} f32, {Q} queries, k={K}, ef={EF}, single-thread search (RTX 5090)");
-    println!("  engine                       |    QPS | recall@{K}");
-    println!("  -----------------------------+--------+----------");
-    println!("  FlatKnn (ours, exact GPU)    | {flat_qps:>6.0} |    1.000 (reference)");
-    match jvector {
-        Some((qps, r)) => println!("  jVector OnDiskGraphIndex     | {qps:>6.0} | {r:>8.3}"),
-        None => println!("  jVector OnDiskGraphIndex     |      - |        -"),
-    }
-    match lucene {
-        Some((qps, r)) => println!("  Lucene HNSW (KnnFloatVector) | {qps:>6.0} | {r:>8.3}"),
-        None => println!("  Lucene HNSW (KnnFloatVector) |      - |        -"),
-    }
+    println!("  engine                         |    QPS | recall@{K}");
+    println!("  -------------------------------+--------+----------");
+    println!("  {:<30} | {flat_qps:>6.0} |    1.000 (ref)", "FlatKnn (ours, exact GPU)");
+    line("jVector — OUR graph", jvector);
+    line("jVector — its NATIVE graph", jvector_native);
+    line("Lucene HNSW — OUR graph", lucene);
+    line("Lucene HNSW — its NATIVE graph", lucene_native);
 }

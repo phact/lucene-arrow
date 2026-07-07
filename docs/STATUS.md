@@ -134,10 +134,35 @@ Lucene/jVector greedy. The fix (`hnsw::small_world_from_cagra`) keeps
 CAGRA's good local edges and adds a few **random long-range edges** per
 node — small-world structure (O(log n) diameter) — which is exactly what
 single-entry greedy needs: recall jumps to ~98%. Both the DoPut write
-path and the bench use it. Note the honest read of the numbers: at ~98%
-recall, exact GPU FlatKnn (3k QPS, 100% recall) is competitive with the
-graph engines, because brute force is cheap on a GPU; Lucene HNSW is
-~2.5× faster at 98% recall. Post-v1: true multi-layer HNSW output.
+path and the bench use it.
+
+**But our graph is still a hack — measured 3–5× worse than native
+construction.** The bench also builds each engine's *own* graph on the
+same data (jVector `GraphIndexBuilder`, Lucene `IndexWriter`) — at 100k,
+ef=100:
+
+| engine, graph source | QPS | recall@10 |
+|---|---|---|
+| FlatKnn (exact GPU) | 2,588 | 1.000 |
+| jVector — our graph | 3,316 | 0.965 |
+| jVector — native | **15,298** | **1.000** |
+| Lucene HNSW — our graph | 7,653 | 0.975 |
+| Lucene HNSW — native | **19,036** | **1.000** |
+
+Both native builders beat our graph decisively on *both* speed and
+recall — so it isn't a jVector-specific shape mismatch (Lucene is only
+slightly more forgiving: 2.5× gap vs jVector's 4.6×). The reason: native
+HNSW/Vamana do **diversity pruning** (non-redundant neighbor selection)
+and build a **multi-layer hierarchy**; ours keeps raw CAGRA local edges +
+*uniform*-random shortcuts, which waste degree and navigate worse. This
+also corrects an earlier reading: with a *proper* graph, graph-ANN beats
+exact FlatKnn even at 100k (Lucene native 19k vs FlatKnn 2.6k = 7×) — our
+graph only looked "competitive with FlatKnn" because it was weak. Recall
+at scale is governed by the search beam (ef) and degree, not the shortcut
+count (scaling shortcuts up *lowers* recall — they steal local edges).
+The real fix is proper multi-layer construction: either port
+HNSW/Vamana-style build, or use cuVS `cuvsHnswFromCagra` (CAGRA →
+hierarchy) and extend our `.vem`/`.vex` writer to multi-level. Post-v1.
 
 ---
 
