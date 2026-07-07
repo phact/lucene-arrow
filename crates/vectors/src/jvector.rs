@@ -95,11 +95,28 @@ pub fn write_index(
     Ok(out)
 }
 
+/// CommonHeader v4 (288 B) + feature bitset (4 B); level-0 records follow.
+const JV_HEADER: usize = 288 + 4;
+
+/// `mmap` a jVector `OnDiskGraphIndex` v5 file and extract its inline f32
+/// vectors — avoids copying the whole file into a `Vec` first. See
+/// [`read_vectors`].
+pub fn read_vectors_file(path: &std::path::Path) -> Result<(Vec<f32>, usize)> {
+    let file = std::fs::File::open(path).map_err(|e| Error::invalid(e.to_string()))?;
+    // Safety: read-only view; the file is not mutated for the map's lifetime.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| Error::invalid(e.to_string()))?;
+    read_vectors(&mmap)
+}
+
 /// Read the inline f32 vectors out of a jVector `OnDiskGraphIndex` v5 file
 /// (big-endian), in ordinal order — the input for a GPU rebuild-merge.
 /// Returns `(vectors_flat, dim)`. Reads only the dense level-0 records'
-/// inline vector payloads; the graph edges are ignored (a merge rebuilds
-/// the graph). Holes (`nodeId == -1`) are skipped.
+/// inline vectors; graph edges are ignored (a merge rebuilds the graph).
+///
+/// The dense case (`nodeId[i] == i`, no deletions — what our writers and a
+/// fresh jVector build produce) extracts records **in parallel** across
+/// threads into a preallocated buffer; a file with holes / reordered ids
+/// falls back to a sequential compaction that skips `nodeId < 0`.
 pub fn read_vectors(bytes: &[u8]) -> Result<(Vec<f32>, usize)> {
     let i32be = |o: usize| -> Result<i32> {
         bytes
@@ -113,21 +130,57 @@ pub fn read_vectors(bytes: &[u8]) -> Result<(Vec<f32>, usize)> {
     let dim = i32be(12)? as usize; // header field 4
     let degree0 = i32be(20)? as usize; // layerInfo[0].degree
     let id_upper = i32be(24)? as usize; // idUpperBound
-    // CommonHeader v4 (288) + feature bitset (4). Level-0 records follow.
-    const HEADER: usize = 288 + 4;
     let record = 4 + dim * 4 + 4 + degree0 * 4; // nodeId + vector + count + edges
+    if dim == 0 || id_upper == 0 {
+        return Ok((Vec::new(), dim));
+    }
+    // One up-front bounds check covers every record read below.
+    let span = id_upper.checked_mul(record).and_then(|s| s.checked_add(JV_HEADER));
+    if span.map(|s| s > bytes.len()).unwrap_or(true) {
+        return Err(Error::corrupt("jvector: truncated records"));
+    }
+
+    // Parallel dense extraction; a thread that sees nodeId != index bails
+    // and we fall back to the (rare) sparse path.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let sparse = AtomicBool::new(false);
+    let mut out = vec![0f32; id_upper * dim];
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    let per = id_upper.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (t, chunk) in out.chunks_mut(per * dim).enumerate() {
+            let sparse = &sparse;
+            s.spawn(move || {
+                let start = t * per;
+                for (local, dst) in chunk.chunks_exact_mut(dim).enumerate() {
+                    let base = JV_HEADER + (start + local) * record;
+                    if i32::from_be_bytes(bytes[base..base + 4].try_into().unwrap())
+                        != (start + local) as i32
+                    {
+                        sparse.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    for (k, d) in dst.iter_mut().enumerate() {
+                        let o = base + 4 + k * 4;
+                        *d = f32::from_be_bytes(bytes[o..o + 4].try_into().unwrap());
+                    }
+                }
+            });
+        }
+    });
+    if !sparse.load(Ordering::Relaxed) {
+        return Ok((out, dim));
+    }
+
+    // Sparse fallback: sequential, compact live records (skip nodeId < 0).
     let mut out = Vec::with_capacity(id_upper * dim);
     for node in 0..id_upper {
-        let base = HEADER + node * record;
-        if i32be(base)? < 0 {
-            continue; // hole
-        }
-        let voff = base + 4;
-        if voff + dim * 4 > bytes.len() {
-            return Err(Error::corrupt("jvector: truncated record"));
+        let base = JV_HEADER + node * record;
+        if i32::from_be_bytes(bytes[base..base + 4].try_into().unwrap()) < 0 {
+            continue;
         }
         for k in 0..dim {
-            let o = voff + k * 4;
+            let o = base + 4 + k * 4;
             out.push(f32::from_be_bytes(bytes[o..o + 4].try_into().unwrap()));
         }
     }
@@ -244,15 +297,42 @@ pub fn write_index_multi(
 mod tests {
     use super::*;
 
-    #[test]
-    fn vectors_round_trip_through_write_then_read() {
-        let (n, dim) = (300usize, 16usize);
+    fn sample(n: usize, dim: usize) -> (Vec<f32>, Vec<u8>) {
         let vecs: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.5 - 7.0).collect();
         let neighbors: Vec<Vec<u32>> =
             (0..n).map(|i| vec![((i + 1) % n) as u32, ((i + n - 1) % n) as u32]).collect();
         let bytes = write_index(&vecs, dim, &neighbors, 0).unwrap();
+        (vecs, bytes)
+    }
+
+    #[test]
+    fn vectors_round_trip_parallel_dense() {
+        // n large enough to span multiple worker threads.
+        let (n, dim) = (20_000usize, 24usize);
+        let (vecs, bytes) = sample(n, dim);
         let (read, d) = read_vectors(&bytes).unwrap();
         assert_eq!(d, dim);
-        assert_eq!(read, vecs, "inline vectors must round-trip exactly");
+        assert_eq!(read, vecs, "inline vectors must round-trip exactly (parallel path)");
+    }
+
+    #[test]
+    fn read_vectors_file_matches_slice() {
+        let (vecs, bytes) = sample(500, 16);
+        let path = std::env::temp_dir().join(format!("la_jv_test_{}.jvector", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let (read, _) = read_vectors_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read, vecs);
+    }
+
+    #[test]
+    fn sparse_fallback_skips_holes() {
+        let (vecs, mut bytes) = sample(64, 8);
+        // Poke a hole: set record 0's nodeId to -1 → the sparse path must
+        // skip it and return the remaining 63 vectors.
+        bytes[JV_HEADER..JV_HEADER + 4].copy_from_slice(&(-1i32).to_be_bytes());
+        let (read, dim) = read_vectors(&bytes).unwrap();
+        assert_eq!(read.len(), 63 * dim);
+        assert_eq!(read, vecs[dim..], "hole at node 0 skipped; rest intact");
     }
 }

@@ -12,6 +12,7 @@ bearing = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 lucene-arrow-cpu = { workspace = true }

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use lucene_arrow_gpu::cuvs_knn::CuvsContext;
 use lucene_arrow_vectors::hnsw::parse_hnswlib;
-use lucene_arrow_vectors::jvector::{read_vectors, write_index, write_index_multi};
+use lucene_arrow_vectors::jvector::{read_vectors_file, write_index, write_index_multi};
 
 const NUM_SRC: usize = 5;
 const CHUNK: usize = 4000;
@@ -54,7 +54,7 @@ fn gpu_rebuild_merge_of_jvector_files() {
     let t_read = Instant::now();
     let mut merged_vecs: Vec<f32> = Vec::new();
     for p in &src_files {
-        let (v, d) = read_vectors(&std::fs::read(p).unwrap()).unwrap();
+        let (v, d) = read_vectors_file(p).unwrap();
         assert_eq!(d, DIM);
         merged_vecs.extend_from_slice(&v);
     }
