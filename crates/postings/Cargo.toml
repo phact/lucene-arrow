@@ -1,0 +1,23 @@
+[package]
+name = "lucene-arrow-postings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lucene-arrow-core = { workspace = true }
+bearing = { workspace = true }
+hashbrown = "0.15"
+
+[dev-dependencies]
+lucene-arrow-codec = { path = "../codec" }
+lucene-arrow-docvalues = { path = "../docvalues" }
+tempfile = "3"
+
+[[bench]]
+name = "csr_bench"
+harness = false
+
+[[bench]]
+name = "bm25_ingest"
+harness = false
