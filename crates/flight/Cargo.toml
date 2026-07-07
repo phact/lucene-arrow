@@ -1,0 +1,43 @@
+[package]
+name = "lucene-arrow-flight"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# GPU executors behind the engine (numeric columns decode on-device);
+# requires a CUDA driver at runtime, dlopen'd — see crates/gpu.
+gpu = ["dep:lucene-arrow-gpu"]
+# vector ingest: GPU graph construction via cuVS (SPEC §10.4)
+cuvs = ["gpu", "lucene-arrow-gpu/cuvs"]
+
+[dependencies]
+lucene-arrow-core = { workspace = true }
+lucene-arrow-codec = { workspace = true }
+lucene-arrow-postings = { path = "../postings" }
+lucene-arrow-docvalues = { workspace = true }
+lucene-arrow-cpu = { workspace = true }
+lucene-arrow-vectors = { workspace = true }
+lucene-arrow-gpu = { workspace = true, features = ["gpu"], optional = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-flight = "59"
+arrow-select = "59"
+arrow-ipc = "59"
+crc32fast = { workspace = true }
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+bearing = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[[bench]]
+name = "write_bench"
+harness = false
