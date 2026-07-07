@@ -66,6 +66,7 @@ RESULTS=()   # "label|logfile" in report order
 
 run() { # run <label> <logfile> <cmd...>
     local label="$1" log="$OUT/$2"; shift 2
+    printf '%s\n' "$*" > "$log.cmd"   # exact command, for the report's reproduce line
     printf '  %-34s ' "$label"
     if "$@" >"$log" 2>&1; then echo "done"; else echo "skip/fail"; fi
     RESULTS+=("$label|$log")
@@ -98,6 +99,7 @@ if [ "$HAVE_JVM" = 1 ]; then
     # BenchIngest both *generates* the numeric index and *is* the write baseline.
     if [ ! -d "$ROOT/harness/bench-index" ]; then
         printf '  %-34s ' "JVM ingest -> bench-index"
+        echo "jvm BenchIngest $ROOT/harness/bench-index $NUM_DOCS" > "$OUT/jvm_write.log.cmd"
         jvm BenchIngest "$ROOT/harness/bench-index" "$NUM_DOCS" >"$OUT/jvm_write.log" 2>&1 && echo "done" || echo "FAIL"
         RESULTS+=("JVM write (BenchIngest)|$OUT/jvm_write.log")
     fi
@@ -166,30 +168,53 @@ echo "==================================================================="
 METRIC='Gval/s|Gdocs/s|GB/s|MB/s|Mvals/s|Mdocs/s|Mpostings/s|Mrows/s|kdocs/s|qps|recall|docs in|queries in|TOTAL|round|fused|SUMMARY|\|'
 
 # Report in the SAME rows/order as the README Performance table, each keyed
-# to its bench log(s). We print the logs' real metric lines (units as the
-# bench emits them) rather than re-parsing into cells — honest over pretty.
-report_row() { # <workflow> <reproduce> <ours-log> [jvm-log...]
-    local label="$1" repro="$2" ourslog="$3"; shift 3
+# to its bench log(s). JVM baseline first, then ours, then the speedup
+# computed from the run's own numbers — comparing the same unit on both
+# sides (given per row). We print the logs' real metric lines (units as the
+# bench emits them) rather than re-parsing into cells; the ratio uses the
+# best matching-unit value found in each log. `run` records each command to
+# <log>.cmd, shown as the reproduce line.
+best_metric() { # <logpath> <unit> -> max numeric value preceding <unit>, or empty
+    [ -f "$1" ] || return
+    grep -haoE "[0-9]+(\.[0-9]+)? $2" "$1" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | sort -g | tail -1
+}
+report_row() { # <workflow> <reproduce-fallback> <compare-unit|-> <ours-log> [jvm-log...]
+    local label="$1" repro="$2" unit="$3" ourslog="$4"; shift 4
+    [ "$unit" = "-" ] && unit=""
     echo; echo "▸ $label"
-    echo "    reproduce │ $repro"
-    local o; o="$(grep -haE "$METRIC" "$OUT/$ourslog" 2>/dev/null | grep -vaE '^[[:space:]]*$' | head -6)"
-    if [ -n "$o" ]; then echo "$o" | sed 's/^/    ours │ /'
-    else echo "    ours │ (no result — GPU/cuVS absent or bench skipped)"; fi
+    local jval=""
     for jl in "$@"; do
-        local j; j="$(grep -haE "$METRIC" "$OUT/$jl" 2>/dev/null | grep -vaE '^[[:space:]]*$' | head -3)"
-        [ -n "$j" ] && echo "$j" | sed 's/^/    jvm  │ /'
+        local jcmd jm
+        jcmd="$(cat "$OUT/$jl.cmd" 2>/dev/null)"
+        jm="$(grep -haE "$METRIC" "$OUT/$jl" 2>/dev/null | grep -vaE '^[[:space:]]*$' | head -3)"
+        [ -z "$jcmd" ] && [ -z "$jm" ] && continue
+        echo "    jvm  │ \$ ${jcmd:-(baseline)}"
+        [ -n "$jm" ] && echo "$jm" | sed 's/^/         │ /'
+        [ -n "$unit" ] && [ -z "$jval" ] && jval="$(best_metric "$OUT/$jl" "$unit")"
     done
+    local ocmd; ocmd="$(cat "$OUT/$ourslog.cmd" 2>/dev/null)"
+    echo "    ours │ \$ ${ocmd:-$repro}"
+    local o; o="$(grep -haE "$METRIC" "$OUT/$ourslog" 2>/dev/null | grep -vaE '^[[:space:]]*$' | head -6)"
+    if [ -n "$o" ]; then echo "$o" | sed 's/^/         │ /'
+    else echo "         │ (no result — GPU/cuVS absent or bench skipped)"; fi
+    if [ -n "$unit" ] && [ -n "$jval" ]; then
+        local oval; oval="$(best_metric "$OUT/$ourslog" "$unit")"
+        [ -n "$oval" ] && awk -v o="$oval" -v j="$jval" -v u="$unit" \
+            'BEGIN { if (j>0) printf "    ═══► ours %.1fx JVM  (%.1f vs %.1f %s)\n", o/j, o, j, u }'
+    fi
 }
 
-report_row "doc-values read, e2e (device-resident Arrow out)" "--bench e2e_decode / BenchScan"        b_e2e_decode.log  j_scan.log
-report_row "doc-values read, GPU kernels only"                "--bench gpu_decode"                    b_gpu_decode.log
-report_row "doc-values write (DoPut, GPU stats+pack)"         "--bench write_bench / BenchIngest"     b_write.log       jvm_write.log
-report_row "HNSW indexing (200k×128, graph + segment)"        "--bench hnsw_build / BenchKnnIngest"   b_hnsw.log        j_knn.log
-report_row "postings scan (12M postings, same checksum)"      "--bench csr_bench / BenchText scan"    b_csr.log         j_pscan.log
-report_row "postings decode, GPU doc-block kernel"            "--bench postings_gpu"                  b_postings_gpu.log
-report_row "BM25 ingest (arXiv markdown), CPU"                "--bench bm25_ingest / BenchMdIngest"   b_bm25ing.log     jvm_bm25_ingest.log
-report_row "BM25 ingest, GPU tokenize (full job)"             "--bench gpu_ingest"                    b_gpuingest.log
-report_row "BM25 scoring (heavy / selective)"                 "--bench bm25_query / BenchBM25Query"   b_bm25q.log       j_bm25q_hvy.log j_bm25q_sel.log
-report_row "vector rebuild-merge (fused GPU extract)"         "--example jvector_merge_scale"         b_merge.log
+#          workflow                                          reproduce-fallback                     unit          ours-log          jvm-log(s)
+report_row "doc-values read, e2e (device-resident Arrow out)" "--bench e2e_decode / BenchScan"      "Mvals/s"     b_e2e_decode.log  j_scan.log
+report_row "doc-values read, GPU kernels only"                "--bench gpu_decode"                  -             b_gpu_decode.log
+report_row "doc-values write (DoPut, GPU stats+pack)"         "--bench write_bench / BenchIngest"   "Mdocs/s"     b_write.log       jvm_write.log
+report_row "HNSW indexing (200k×128, graph + segment)"        "--bench hnsw_build / BenchKnnIngest" "kdocs/s"     b_hnsw.log        j_knn.log
+report_row "postings scan (12M postings, same checksum)"      "--bench csr_bench / BenchText scan"  "Mpostings/s" b_csr.log         j_pscan.log
+report_row "postings decode, GPU doc-block kernel"            "--bench postings_gpu"                -             b_postings_gpu.log
+report_row "BM25 ingest (arXiv markdown), CPU"                "--bench bm25_ingest / BenchMdIngest" "kdocs/s"     b_bm25ing.log     jvm_bm25_ingest.log
+report_row "BM25 ingest, GPU tokenize (full job)"             "--bench gpu_ingest"                  -             b_gpuingest.log
+report_row "BM25 scoring (heavy / selective)"                 "--bench bm25_query / BenchBM25Query" -             b_bm25q.log       j_bm25q_hvy.log j_bm25q_sel.log
+report_row "vector rebuild-merge (fused GPU extract)"         "--example jvector_merge_scale"       -             b_merge.log
 echo; echo "==================================================================="
-echo "full per-bench logs in $OUT"
+echo "full per-bench logs in $OUT   ·   'jvm \$' shows the class; jvm = java --add-modules jdk.incubator.vector -cp <lucene.jar>:classes"
+echo "cuVS/GPU 'ours \$' rows need the pixi env exported first (see README Build)"

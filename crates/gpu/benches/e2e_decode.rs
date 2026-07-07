@@ -162,4 +162,7 @@ fn main() {
         payload_gb / median(upload_secs),
         median(kernel_secs) * 1e3,
     );
+    // Headline in the same unit as the JVM BenchScan baseline, for the
+    // bench-all report's speedup (best config = pinned ring).
+    println!("  best (pinned ring): {:.1} Mvals/s", total_rows as f64 / pinned_t / 1e6);
 }
