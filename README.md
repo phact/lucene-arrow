@@ -11,8 +11,9 @@ cuDF/cuPy. An RTX 5090 does the heavy lifting — decode, encode, ANN graph buil
 BM25 scoring, text tokenization — while the CPU path is the correctness
 reference every GPU kernel is checked bit-identical against.
 
-Concept and contracts: [`SPEC.md`](SPEC.md). Full phase-by-phase status and
-benchmark methodology: [`docs/STATUS.md`](docs/STATUS.md).
+Concept and contracts: [`SPEC.md`](SPEC.md). 
+
+Full phase-by-phase status and benchmark methodology: [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Capabilities
 
@@ -47,7 +48,6 @@ cargo build --workspace
 
 **GPU** (`gpu` feature) needs an NVIDIA GPU and CUDA 12.x runtime — kernels are
 NVRTC-compiled at run time, so there is no build-time `nvcc` dependency.
-Developed on an RTX 5090 / CUDA 12.9.
 
 ```bash
 cargo build -p lucene-arrow-gpu --features gpu
@@ -122,7 +122,9 @@ cargo test -p lucene-arrow-gpu -p lucene-arrow-flight \
 ```
 
 The Rust suite runs against committed golden segments (real Java Lucene 10.3.2).
-To regenerate them or run the CheckIndex acceptance gate (needs JDK 21):
+To regenerate them or run the CheckIndex acceptance gate — Java's own
+corruption checker; a pass means real Lucene / Elasticsearch / OpenSearch can
+open the segment (needs JDK 21):
 
 ```bash
 harness/run.sh golden harness/golden    # write fresh Java goldens
@@ -136,6 +138,11 @@ Every row is reproducible with the noted command (`--bench` = `cargo bench -p
 lucene-arrow-gpu`; `Bench*` / `run.sh` = the JVM harness). Full methodology in
 [`docs/STATUS.md`](docs/STATUS.md).
 
+Reproduce the whole table in one shot — `scripts/bench-all.sh` detects
+GPU / cuVS / JVM, generates any missing inputs, runs every bench and JVM
+baseline, and prints a consolidated report (CPU rows run anywhere; the rest
+fill in when available; `QUICK=1` for a fast smoke run).
+
 | workflow | ours | JVM | speedup | reproduce |
 |---|---|---|---|---|
 | doc-values **read**, e2e (device-resident Arrow out) | 4,006 Mvals/s | 316 Mvals/s | **12.7×** | `--bench e2e_decode` / `BenchScan` |
@@ -148,19 +155,3 @@ lucene-arrow-gpu`; `Bench*` / `run.sh` = the JVM harness). Full methodology in
 | BM25 ingest, GPU tokenize (full job) | ~138 ms | 1.33 s | **~9.6×** | `--bench gpu_ingest` |
 | **BM25 scoring**, heavy queries | 5.5k qps (379 Mrows/s) | 4.3k qps | 1.27× | `--bench bm25_query` / `BenchBM25Query` |
 | BM25 scoring, selective queries | 4.8k qps | 19.6k qps | 0.24× | `--bench bm25_query` |
-
-Two results worth reading honestly rather than as headlines:
-
-- **Reads win biggest, scoring wins least.** Decode is pure bit-unpacking — no
-  algorithmic cleverness is available to anyone, so it's a raw-throughput race
-  the GPU dominates (12.7× e2e, 154× kernel). BM25 *scoring* is the opposite:
-  Lucene's impact-skipping algorithmically avoids most of the work, so
-  exhaustive GPU scoring only wins on heavy / analytics queries and loses on
-  selective top-k. GPU speedup tracks how little the CPU baseline can skip, not
-  how "compute-heavy" the task sounds.
-- **ANN / vector search** three-way (`--bench knn_threeway`, 1M×128, k=10): our
-  zero-dependency exact FlatKnn 227 ms, cuVS brute force 150 ms, cuVS CAGRA
-  graph build 1.5 s — the build time is the datum, since JVM HNSW builds take
-  minutes. (cuVS brute force must use `L2Unexpanded`; the expanded form
-  catastrophically cancels on near-duplicate vectors — our FlatKnn caught it
-  returning a wrong top-1.)
