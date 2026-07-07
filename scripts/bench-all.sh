@@ -160,18 +160,32 @@ echo; echo "[4/4] results"
 echo "==================================================================="
 # Metric keywords, plus `\|` so table rows (engine | build | ... ) print too.
 METRIC='Gval/s|Gdocs/s|GB/s|MB/s|Mvals/s|Mdocs/s|Mpostings/s|Mrows/s|kdocs/s|qps|recall|docs in|queries in|TOTAL|round|fused|SUMMARY|\|'
-for entry in "${RESULTS[@]}"; do
-    label="${entry%%|*}"; log="${entry##*|}"
+
+# Report in the SAME rows/order as the README Performance table, each keyed
+# to its bench log(s). We print the logs' real metric lines (units as the
+# bench emits them) rather than re-parsing into cells — honest over pretty.
+report_row() { # <workflow> <reproduce> <ours-log> [jvm-log...]
+    local label="$1" repro="$2" ourslog="$3"; shift 3
     echo; echo "▸ $label"
-    lines=""
-    [ -f "$log" ] && lines="$(grep -hE "$METRIC" "$log" 2>/dev/null)"
-    if [ -n "$lines" ]; then
-        echo "$lines" | sed 's/^/    /'
-    elif [ -f "$log" ]; then
-        grep -vE '^[[:space:]]*$' "$log" | tail -n 5 | sed 's/^/    /'   # fallback: last lines
-    else
-        echo "    (no log — $log)"
-    fi
-done
+    echo "    reproduce │ $repro"
+    local o; o="$(grep -haE "$METRIC" "$OUT/$ourslog" 2>/dev/null | grep -vaE '^[[:space:]]*$' | head -6)"
+    if [ -n "$o" ]; then echo "$o" | sed 's/^/    ours │ /'
+    else echo "    ours │ (no result — GPU/cuVS absent or bench skipped)"; fi
+    for jl in "$@"; do
+        local j; j="$(grep -haE "$METRIC" "$OUT/$jl" 2>/dev/null | grep -vaE '^[[:space:]]*$' | head -3)"
+        [ -n "$j" ] && echo "$j" | sed 's/^/    jvm  │ /'
+    done
+}
+
+report_row "doc-values read, e2e (device-resident Arrow out)" "--bench e2e_decode / BenchScan"        b_e2e_decode.log  j_scan.log
+report_row "doc-values read, GPU kernels only"                "--bench gpu_decode"                    b_gpu_decode.log
+report_row "doc-values write (DoPut, GPU stats+pack)"         "--bench write_bench / BenchIngest"     b_write.log       jvm_write.log
+report_row "HNSW indexing (200k×128, graph + segment)"        "--bench hnsw_build / BenchKnnIngest"   b_hnsw.log        j_knn.log
+report_row "postings scan (12M postings, same checksum)"      "--bench csr_bench / BenchText scan"    b_csr.log         j_pscan.log
+report_row "postings decode, GPU doc-block kernel"            "--bench postings_gpu"                  b_postings_gpu.log
+report_row "BM25 ingest (arXiv markdown), CPU"                "--bench bm25_ingest / BenchMdIngest"   b_bm25ing.log     jvm_bm25_ingest.log
+report_row "BM25 ingest, GPU tokenize (full job)"             "--bench gpu_ingest"                    b_gpuingest.log
+report_row "BM25 scoring (heavy / selective)"                 "--bench bm25_query / BenchBM25Query"   b_bm25q.log       j_bm25q_hvy.log j_bm25q_sel.log
+report_row "vector rebuild-merge (fused GPU extract)"         "--example jvector_merge_scale"         b_merge.log
 echo; echo "==================================================================="
 echo "full per-bench logs in $OUT"

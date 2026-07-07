@@ -155,3 +155,4 @@ fill in when available; `QUICK=1` for a fast smoke run).
 | BM25 ingest, GPU tokenize (full job) | ~138 ms | 1.33 s | **~9.6×** | `--bench gpu_ingest` |
 | **BM25 scoring**, heavy queries | 5.5k qps (379 Mrows/s) | 4.3k qps | 1.27× | `--bench bm25_query` / `BenchBM25Query` |
 | BM25 scoring, selective queries | 4.8k qps | 19.6k qps | 0.24× | `--bench bm25_query` |
+| vector rebuild-merge, fused GPU **extract** (2M×1536) | 15 GB/s | 3.1 GB/s (CPU) | **4.8×** | `--example jvector_merge_scale` |
