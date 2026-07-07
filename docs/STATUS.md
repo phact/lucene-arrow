@@ -194,8 +194,11 @@ letting cuVS build the hierarchy (`cuvsHnswFromCagra`) and faithfully
 re-serializing it into both formats. Gate `p_multilevel`: CheckIndex +
 Java `KnnFloatVectorQuery` (Lucene) and the real jVector library
 (jVector) both open and search our multi-level files with exact top-1.
-Remaining: wire the multi-level hierarchy into the DoPut write path
-(currently single-level small-world) so ingested vectors get it too.
+The DoPut write path uses it too: `build_graph` returns the multi-level
+hierarchy (CAGRA→cuVS HNSW→parse for segments > 4096 docs; exact CPU kNN
+wrapped as one level below that) and `flush_segment` writes it via
+`add_field_multi`, so vectors ingested over Flight get native-quality
+graphs (`flight_vectors` gate green).
 
 ---
 

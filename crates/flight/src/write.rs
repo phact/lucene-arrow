@@ -454,17 +454,18 @@ impl WriteSession {
                 &payload,
                 self.docs_in_segment,
             )?;
-            let neighbors = build_graph(data, dim as usize)?;
+            let parsed = build_graph(data, dim as usize)?;
             hnsw.get_or_insert_with(|| {
                 lucene_arrow_vectors::hnsw::HnswFilesBuilder::new(&id, suffix)
             })
-            .add_field(
+            .add_field_multi(
                 i as i32,
                 lucene_arrow_vectors::VectorEncoding::Float32,
                 sim,
                 dim as u32,
-                &neighbors,
-                (neighbors.iter().map(|n| n.len()).max().unwrap_or(2).max(2) as u32).div_ceil(2),
+                parsed.count,
+                parsed.m,
+                &parsed.levels,
             )?;
         }
         if let (Some(f), Some(h)) = (flat, hnsw) {
@@ -750,16 +751,19 @@ fn append_column(
 }
 
 
-/// Build a navigable single-level graph for one segment's vectors.
-/// GPU (NN-Descent) when the `cuvs` build is active and the segment is
-/// big enough; tiny segments use an exact CPU kNN graph.
-fn build_graph(data: &[f32], dim: usize) -> Result<Vec<Vec<u32>>> {
+/// Build the HNSW graph for one segment's vectors as a multi-level
+/// hierarchy. Large segments (`cuvs` build) go CAGRA → cuVS HNSW
+/// hierarchy → parse — near-native search quality. Tiny segments use an
+/// exact CPU kNN graph wrapped as a single level (no GPU needed).
+fn build_graph(data: &[f32], dim: usize) -> Result<lucene_arrow_vectors::hnsw::HnswParsed> {
+    use lucene_arrow_vectors::hnsw::HnswParsed;
     let n = data.len() / dim;
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok(HnswParsed { count: 0, m: 1, entry: 0, levels: vec![Vec::new()] });
     }
     let degree = 32usize.min(n.saturating_sub(1)).max(1);
-    // Exact CPU graph for small segments (also the no-GPU fallback there).
+    // Exact CPU graph for small segments (also the no-GPU fallback there),
+    // wrapped as a single-level hierarchy.
     if n <= 4096 {
         let mut out: Vec<Vec<u32>> = Vec::with_capacity(n);
         for i in 0..n {
@@ -777,21 +781,37 @@ fn build_graph(data: &[f32], dim: usize) -> Result<Vec<Vec<u32>>> {
             out.push(scored.into_iter().map(|(_, j)| j).collect());
         }
         let flat: Vec<u32> = out.iter().flat_map(|l| l.iter().copied()).collect();
-        // ragged-safe: all lists are `degree` long except when n <= degree
-        if out.iter().all(|l| l.len() == degree) {
-            return Ok(lucene_arrow_vectors::hnsw::navigable_from_knn(&flat, n, degree, degree.max(2)));
-        }
-        return Ok(out);
+        let single = if out.iter().all(|l| l.len() == degree) {
+            lucene_arrow_vectors::hnsw::navigable_from_knn(&flat, n, degree, degree.max(2))
+        } else {
+            out
+        };
+        let level0 = single.into_iter().enumerate().map(|(i, nb)| (i as u32, nb)).collect();
+        return Ok(HnswParsed {
+            count: n,
+            m: (degree / 2).max(1) as u32,
+            entry: 0,
+            levels: vec![level0],
+        });
     }
     #[cfg(feature = "cuvs")]
     {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let ctx = lucene_arrow_gpu::cuvs_knn::CuvsContext::new()
             .map_err(|e| Error::invalid(format!("vector ingest needs a GPU at this size: {e}")))?;
-        // CAGRA's search-optimized graph + small-world augmentation — the
-        // combination that gives Lucene/jVector greedy search real recall
-        // at scale (a raw kNN graph does not; see vectors::hnsw).
-        let (graph, gdeg) = ctx.cagra_graph(data, dim, degree)?;
-        Ok(lucene_arrow_vectors::hnsw::small_world_from_cagra(&graph, n, gdeg, degree))
+        // CAGRA → cuVS HNSW hierarchy (hierarchy=CPU → standard hnswlib) →
+        // parse → multi-level graph (near-native recall/QPS; see vectors::hnsw).
+        let tmp = std::env::temp_dir().join(format!(
+            "la_hnsw_{}_{}.bin",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = tmp.to_str().ok_or_else(|| Error::invalid("non-utf8 temp path"))?;
+        ctx.cagra_to_hnswlib(data, dim, degree / 2, 100, path)?;
+        let bytes = std::fs::read(&tmp).map_err(|e| Error::invalid(e.to_string()))?;
+        let _ = std::fs::remove_file(&tmp);
+        lucene_arrow_vectors::hnsw::parse_hnswlib(&bytes)
     }
     #[cfg(not(feature = "cuvs"))]
     Err(Error::invalid("vector ingest needs the cuvs build for segments > 4096 docs"))
