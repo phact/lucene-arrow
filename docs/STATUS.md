@@ -164,6 +164,22 @@ The real fix is proper multi-layer construction: either port
 HNSW/Vamana-style build, or use cuVS `cuvsHnswFromCagra` (CAGRA →
 hierarchy) and extend our `.vem`/`.vex` writer to multi-level. Post-v1.
 
+**Update — done for Lucene.** Implemented exactly that: CAGRA →
+`cuvsHnswFromCagra` (hierarchy=CPU → standard hnswlib) → `parse_hnswlib`
+→ `HnswFilesBuilder::add_field_multi` (real multi-layer Lucene99
+`.vem`/`.vex`). Gate `p_multilevel`: 4-level pyramid (5000/324/13/1),
+CheckIndex clean, Java KNN exact. Result at 100k, ef=100:
+
+| engine, graph source | QPS | recall@10 |
+|---|---|---|
+| Lucene HNSW — our multi-level | **16,329** | 0.978 |
+| Lucene HNSW — native | 19,005 | 1.000 |
+
+Gap closed from 2.5× to **1.16×**. jVector still uses our single-level
+graph (its writer is single-level); extending the jVector
+`OnDiskGraphIndex` writer to multi-layer (its `writeSparseLevels` is
+simple) would close its gap the same way — remaining follow-up.
+
 ---
 
 ## P7 — postings relation (§7.8)

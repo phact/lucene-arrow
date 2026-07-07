@@ -4,9 +4,10 @@
 //! GPU FlatKnn (Rust); jVector and Lucene HNSW reading the graph *we*
 //! wrote; and jVector and Lucene searching graphs built by their *own*
 //! native builders. The native rows isolate graph quality — is our graph
-//! bad in general, or bad for a specific engine? (Answer: our
-//! CAGRA + random-shortcut graph is ~3-5x worse than both native builders
-//! on speed and recall — proper diversity pruning + hierarchy wins.)
+//! bad in general, or bad for a specific engine? Our Lucene segment now
+//! carries a real multi-layer hierarchy (CAGRA -> cuvsHnswFromCagra ->
+//! parse -> multi-level .vem/.vex) and lands within ~1.2x of native; the
+//! jVector file is still single-level and lags its native builder.)
 //! Ground-truth top-k is the FlatKnn exact result; node/doc ids share the
 //! ordinal space, so recall is directly comparable.
 //!
