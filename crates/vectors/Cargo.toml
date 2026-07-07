@@ -1,0 +1,17 @@
+[package]
+name = "lucene-arrow-vectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lucene-arrow-core = { workspace = true }
+lucene-arrow-docvalues = { workspace = true }
+bearing = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+
+[dev-dependencies]
+lucene-arrow-cpu = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "lucene-arrow-faiss-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lucene-arrow-core = { workspace = true }
