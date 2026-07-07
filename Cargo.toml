@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/docvalues",
+    "crates/vectors",
+    "crates/faiss-source",
+    "crates/cpu",
+    "crates/gpu",
+    "crates/flight",
+    "crates/codec",
+    "crates/postings",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+repository = "https://github.com/example/lucene-arrow"
+
+[workspace.dependencies]
+lucene-arrow-core = { path = "crates/core" }
+lucene-arrow-codec = { path = "crates/codec" }
+lucene-arrow-docvalues = { path = "crates/docvalues" }
+lucene-arrow-cpu = { path = "crates/cpu" }
+lucene-arrow-vectors = { path = "crates/vectors" }
+lucene-arrow-gpu = { path = "crates/gpu" }
+
+arrow = "59"
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-schema = { version = "59", features = ["serde"] }
+bearing = { version = "0.1.0-alpha.5", default-features = false }
+memmap2 = "0.9"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = "thin"
+debug = 1
+
+# Vendored Bearing (Apache-2.0) with a minimal visibility patch:
+# `BlockTreeTermsWriter` is pub so the P9 write path can feed it our
+# GPU-aggregated postings (upstream has it pub(crate); patch proposed
+# upstream). Tracked at vendor/bearing, based on 0.1.0-alpha.5 @ 60d9e90.
+[patch.crates-io]
+bearing = { path = "vendor/bearing" }

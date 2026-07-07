@@ -1,0 +1,8 @@
+/target
+harness/build/
+harness/lib/
+harness/bench-index/
+/.claude/
+/.pixi/
+harness/bench-text/
+*.swp
