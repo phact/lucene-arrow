@@ -95,6 +95,45 @@ pub fn write_index(
     Ok(out)
 }
 
+/// Read the inline f32 vectors out of a jVector `OnDiskGraphIndex` v5 file
+/// (big-endian), in ordinal order — the input for a GPU rebuild-merge.
+/// Returns `(vectors_flat, dim)`. Reads only the dense level-0 records'
+/// inline vector payloads; the graph edges are ignored (a merge rebuilds
+/// the graph). Holes (`nodeId == -1`) are skipped.
+pub fn read_vectors(bytes: &[u8]) -> Result<(Vec<f32>, usize)> {
+    let i32be = |o: usize| -> Result<i32> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| Error::corrupt("jvector: truncated"))
+    };
+    if i32be(0)? != MAGIC {
+        return Err(Error::invalid("not a jVector index (bad magic)"));
+    }
+    let dim = i32be(12)? as usize; // header field 4
+    let degree0 = i32be(20)? as usize; // layerInfo[0].degree
+    let id_upper = i32be(24)? as usize; // idUpperBound
+    // CommonHeader v4 (288) + feature bitset (4). Level-0 records follow.
+    const HEADER: usize = 288 + 4;
+    let record = 4 + dim * 4 + 4 + degree0 * 4; // nodeId + vector + count + edges
+    let mut out = Vec::with_capacity(id_upper * dim);
+    for node in 0..id_upper {
+        let base = HEADER + node * record;
+        if i32be(base)? < 0 {
+            continue; // hole
+        }
+        let voff = base + 4;
+        if voff + dim * 4 > bytes.len() {
+            return Err(Error::corrupt("jvector: truncated record"));
+        }
+        for k in 0..dim {
+            let o = voff + k * 4;
+            out.push(f32::from_be_bytes(bytes[o..o + 4].try_into().unwrap()));
+        }
+    }
+    Ok((out, dim))
+}
+
 /// Dedup/self-drop/cap a node's neighbor list, preserving order.
 fn clean_edges(nbrs: &[u32], n: usize, node: usize, cap: usize) -> Vec<u32> {
     let mut seen = std::collections::BTreeSet::new();
@@ -199,4 +238,21 @@ pub fn write_index_multi(
     out.extend_from_slice(&header_offset.to_be_bytes());
     put_i32(&mut out, FOOTER_MAGIC);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vectors_round_trip_through_write_then_read() {
+        let (n, dim) = (300usize, 16usize);
+        let vecs: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.5 - 7.0).collect();
+        let neighbors: Vec<Vec<u32>> =
+            (0..n).map(|i| vec![((i + 1) % n) as u32, ((i + n - 1) % n) as u32]).collect();
+        let bytes = write_index(&vecs, dim, &neighbors, 0).unwrap();
+        let (read, d) = read_vectors(&bytes).unwrap();
+        assert_eq!(d, dim);
+        assert_eq!(read, vecs, "inline vectors must round-trip exactly");
+    }
 }
