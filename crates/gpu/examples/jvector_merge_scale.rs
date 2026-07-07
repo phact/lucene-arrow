@@ -41,7 +41,9 @@ fn main() {
         let Ok(ctx) = CuvsContext::new() else { return eprintln!("cuVS unavailable") };
         let Ok(gpu) = GpuDecoder::new() else { return eprintln!("no CUDA device") };
 
-        let dir = std::env::temp_dir().join("la_merge_scale");
+        // Scale-specific dir so a re-run at a different DIM/N doesn't reuse
+        // stale source files.
+        let dir = std::env::temp_dir().join(format!("la_merge_scale_{dim}_{per}_{src}"));
         std::fs::create_dir_all(&dir).unwrap();
         eprintln!(
             "scale: {src} files × {per} vectors × {dim}d = {n} total ({:.1} GB on disk)",
@@ -138,6 +140,13 @@ fn main() {
             read_cold_s,
             gather_s,
             read_cold_s / gather_s
+        );
+        // One-line summary (GB/s keyword → captured by bench-all's report).
+        println!(
+            "SUMMARY merge {n}×{dim}d: extract {:.2} GB/s ({:.1}× CPU read), merge {:.2}× fused",
+            gb / gather_s,
+            read_cold_s / gather_s,
+            host_total / fused_total
         );
     }
 }

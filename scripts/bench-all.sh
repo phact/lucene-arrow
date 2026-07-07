@@ -20,10 +20,15 @@ cd "$ROOT"
 
 if [ "${QUICK:-0}" = 1 ]; then
     NUM_DOCS="${NUM_DOCS:-1000000}"; TEXT_DOCS="${TEXT_DOCS:-400000}"; CORPUS_DOCS="${CORPUS_DOCS:-50000}"
+    MERGE_N="${MERGE_N:-200000}"
 fi
 NUM_DOCS="${NUM_DOCS:-16000000}"
 TEXT_DOCS="${TEXT_DOCS:-4000000}"
 CORPUS_DOCS="${CORPUS_DOCS:-300000}"
+# jVector rebuild-merge scale test (fused GPU extract vs CPU). Realistic
+# embedding dim; N is total vectors across SRC files (writes N*DIM*4 B to /tmp).
+MERGE_DIM="${MERGE_DIM:-1536}"
+MERGE_N="${MERGE_N:-1000000}"
 
 OUT="$ROOT/target/bench-results"
 mkdir -p "$OUT"
@@ -125,6 +130,9 @@ fi
 if [ "$HAVE_CUVS" = 1 ]; then
     run "cuvs: knn three-way" b_knn3.log  cargo bench -q -p lucene-arrow-gpu --features cuvs --bench knn_threeway
     run "cuvs: hnsw build"    b_hnsw.log  cargo bench -q -p lucene-arrow-gpu --features cuvs --bench hnsw_build
+    run "cuvs: jvector merge (fused extract)" b_merge.log \
+        env DIM="$MERGE_DIM" N="$MERGE_N" SRC=4 \
+        cargo run -q --release -p lucene-arrow-gpu --features cuvs --example jvector_merge_scale
 else
     echo "  (no pixi/libcuvs env — skipping cuvs benches)"
 fi
@@ -151,7 +159,7 @@ fi
 echo; echo "[4/4] results"
 echo "==================================================================="
 # Metric keywords, plus `\|` so table rows (engine | build | ... ) print too.
-METRIC='Gval/s|Gdocs/s|GB/s|MB/s|Mvals/s|Mdocs/s|Mpostings/s|Mrows/s|kdocs/s|qps|recall|docs in|queries in|TOTAL|round|\|'
+METRIC='Gval/s|Gdocs/s|GB/s|MB/s|Mvals/s|Mdocs/s|Mpostings/s|Mrows/s|kdocs/s|qps|recall|docs in|queries in|TOTAL|round|fused|SUMMARY|\|'
 for entry in "${RESULTS[@]}"; do
     label="${entry%%|*}"; log="${entry##*|}"
     echo; echo "▸ $label"
