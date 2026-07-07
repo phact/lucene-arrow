@@ -72,6 +72,14 @@ fn main() {
     let suffix = "Lucene99HnswVectorsFormat_0";
     let payload: Vec<u8> = vectors.iter().flat_map(|v| v.to_le_bytes()).collect();
 
+    // Multi-level HNSW hierarchy for the Lucene segment: CAGRA → cuVS HNSW
+    // hierarchy (hierarchy=CPU, standard hnswlib) → parse → our multi-level
+    // .vem/.vex writer.
+    let hfile = tmp.path().join("h.hnsw");
+    ctx.cagra_to_hnswlib(&vectors, DIM, DEGREE / 2, 100, hfile.to_str().unwrap()).unwrap();
+    let parsed =
+        lucene_arrow_vectors::hnsw::parse_hnswlib(&std::fs::read(&hfile).unwrap()).unwrap();
+
     // jVector file.
     let jv_path = tmp.path().join("graph.jvector");
     std::fs::write(&jv_path, write_index(&vectors, DIM, &neighbors, 0).unwrap()).unwrap();
@@ -84,7 +92,7 @@ fn main() {
         .unwrap();
     let (vemf, vecbytes) = flatb.finish();
     let mut hnsw = HnswFilesBuilder::new(&seg_id, suffix);
-    hnsw.add_field(0, VectorEncoding::Float32, Similarity::Euclidean, DIM as u32, &neighbors, (DEGREE / 2) as u32)
+    hnsw.add_field_multi(0, VectorEncoding::Float32, Similarity::Euclidean, DIM as u32, N, parsed.m, &parsed.levels)
         .unwrap();
     let (vem, vex) = hnsw.finish();
     let lucdir = tmp.path().join("lucene");

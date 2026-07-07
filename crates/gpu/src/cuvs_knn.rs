@@ -222,6 +222,57 @@ impl CuvsContext {
         }
     }
 
+    /// Build a CAGRA index, convert it to a **multi-layer HNSW hierarchy**
+    /// on the CPU (`cuvsHnswFromCagra`, hierarchy=CPU → standard hnswlib
+    /// format), and serialize to `out_path`. The result is a proper HNSW
+    /// index (diversity + layers) that we parse and re-emit as Lucene
+    /// `.vem`/`.vex`, closing the gap to native graph quality.
+    pub fn cagra_to_hnswlib(
+        &self,
+        vectors: &[f32],
+        dim: usize,
+        m: usize,
+        ef_construction: i32,
+        out_path: &str,
+    ) -> Result<()> {
+        use cuvs_sys as ffi;
+        let n = vectors.len() / dim;
+        let dataset = ndarray::Array2::from_shape_vec((n, dim), vectors.to_vec())
+            .map_err(|e| Error::invalid(e.to_string()))?;
+        let dataset_dev = ManagedTensor::from(&dataset).to_device(&self.res).map_err(cuvs_err)?;
+        let cpath = std::ffi::CString::new(out_path).map_err(|e| Error::invalid(e.to_string()))?;
+
+        // Safety: C API with valid handles; all created objects destroyed.
+        unsafe {
+            let mut cparams: ffi::cuvsCagraIndexParams_t = std::ptr::null_mut();
+            check(ffi::cuvsCagraIndexParamsCreate(&mut cparams))?;
+            (*cparams).graph_degree = 2 * m; // CAGRA graph → HNSW level-0 (maxM0 = 2M)
+            (*cparams).intermediate_graph_degree = (4 * m).max((*cparams).intermediate_graph_degree);
+            let mut cindex: ffi::cuvsCagraIndex_t = std::ptr::null_mut();
+            check(ffi::cuvsCagraIndexCreate(&mut cindex))?;
+
+            let mut hparams: ffi::cuvsHnswIndexParams_t = std::ptr::null_mut();
+            check(ffi::cuvsHnswIndexParamsCreate(&mut hparams))?;
+            (*hparams).hierarchy = ffi::cuvsHnswHierarchy::CPU;
+            (*hparams).M = m;
+            (*hparams).ef_construction = ef_construction;
+            let mut hindex: ffi::cuvsHnswIndex_t = std::ptr::null_mut();
+            check(ffi::cuvsHnswIndexCreate(&mut hindex))?;
+
+            let result = (|| {
+                check(ffi::cuvsCagraBuild(self.res.0, cparams, dataset_dev.as_ptr(), cindex))?;
+                check(ffi::cuvsHnswFromCagra(self.res.0, hparams, cindex, hindex))?;
+                check(ffi::cuvsHnswSerialize(self.res.0, cpath.as_ptr(), hindex))
+            })();
+
+            let _ = ffi::cuvsHnswIndexDestroy(hindex);
+            let _ = ffi::cuvsHnswIndexParamsDestroy(hparams);
+            let _ = ffi::cuvsCagraIndexDestroy(cindex);
+            let _ = ffi::cuvsCagraIndexParamsDestroy(cparams);
+            result
+        }
+    }
+
     fn search_common(
         &self,
         nq: usize,
