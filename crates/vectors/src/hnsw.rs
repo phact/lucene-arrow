@@ -116,6 +116,8 @@ pub fn small_world_from_cagra(graph: &[u32], n: usize, degree: usize, cap: usize
 pub struct HnswParsed {
     pub count: usize,
     pub m: u32,
+    /// Entry-point ordinal (a node present on the top level).
+    pub entry: u32,
     pub levels: Vec<Vec<(u32, Vec<u32>)>>,
 }
 
@@ -187,7 +189,8 @@ pub fn parse_hnswlib(b: &[u8]) -> Result<HnswParsed> {
             levels[lvl].push((label[i], remap(&upper[i][lvl - 1])));
         }
     }
-    Ok(HnswParsed { count, m, levels })
+    let entry = label[u32at(52) as usize % count.max(1)];
+    Ok(HnswParsed { count, m, entry, levels })
 }
 
 /// Builds one `.vem` + `.vex` pair field by field.

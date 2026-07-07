@@ -108,5 +108,34 @@ fn multilevel_hnsw_checkindex_and_knn() {
         assert_eq!(hits.first(), Some(&(qdoc as u32)), "doc {qdoc}: own vector not top-1, got {hits:?}");
         checked += 1;
     }
-    eprintln!("multi-level HNSW: CheckIndex clean + KNN top-1 exact for {checked} queries");
+    eprintln!("Lucene multi-level: CheckIndex clean + KNN top-1 exact for {checked} queries");
+
+    // jVector multi-layer: write, then the real jVector library must open
+    // and search it, returning each query's own vector top-1.
+    let jvfile = tmp.path().join("g.jvector");
+    std::fs::write(
+        &jvfile,
+        lucene_arrow_vectors::jvector::write_index_multi(&vectors, DIM, &parsed).unwrap(),
+    )
+    .unwrap();
+    let jcp = format!(
+        "{0}/lib/jvector-4.0.0-beta.6.jar:{0}/lib/commons-math3-3.6.1.jar:{0}/lib/agrona-1.20.0.jar:{0}/lib/slf4j-api-2.0.13.jar:{1}",
+        harness.display(), build.display()
+    );
+    std::process::Command::new(java.parent().unwrap().join("javac"))
+        .args(["-cp"]).arg(&jcp).args(["-d"]).arg(&build).arg(harness.join("src/VerifyJVector.java"))
+        .status().unwrap();
+    let mut jchecked = 0;
+    for &qdoc in &[7usize, 1234, 4999] {
+        let o = std::process::Command::new(java)
+            .args(["--add-modules", "jdk.incubator.vector", "-cp", &jcp, "VerifyJVector"])
+            .arg(&jvfile).args(["x", &qdoc.to_string(), "10"])
+            .output().unwrap();
+        assert!(o.status.success(), "VerifyJVector failed: {}", String::from_utf8_lossy(&o.stderr));
+        let hits: Vec<u32> = String::from_utf8_lossy(&o.stdout).lines()
+            .filter_map(|l| l.split(',').next()?.parse().ok()).collect();
+        assert_eq!(hits.first(), Some(&(qdoc as u32)), "jvector doc {qdoc}: own vector not top-1, got {hits:?}");
+        jchecked += 1;
+    }
+    eprintln!("jVector multi-level: library opened + searched, top-1 exact for {jchecked} queries");
 }

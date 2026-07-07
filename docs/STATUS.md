@@ -175,10 +175,27 @@ CheckIndex clean, Java KNN exact. Result at 100k, ef=100:
 | Lucene HNSW — our multi-level | **16,329** | 0.978 |
 | Lucene HNSW — native | 19,005 | 1.000 |
 
-Gap closed from 2.5× to **1.16×**. jVector still uses our single-level
-graph (its writer is single-level); extending the jVector
-`OnDiskGraphIndex` writer to multi-layer (its `writeSparseLevels` is
-simple) would close its gap the same way — remaining follow-up.
+Then the jVector `OnDiskGraphIndex` writer got the same multi-layer
+treatment (`write_index_multi`: layer table + dense L0 + sparse upper
+levels), fed the same parsed hierarchy. Final five-way (100k, ef=100):
+
+| engine, graph source | QPS | recall@10 |
+|---|---|---|
+| FlatKnn (exact GPU) | 2,692 | 1.000 |
+| jVector — ours (multi-level) | **16,650** | 0.986 |
+| jVector — native | 15,669 | 1.000 |
+| Lucene HNSW — ours (multi-level) | 15,649 | 0.986 |
+| Lucene HNSW — native | 18,772 | 1.000 |
+
+Both our files now land **at native** — jVector-ours actually edges out
+jVector's own builder on QPS; Lucene-ours is within ~1.2×, all at ~0.986
+recall. From "3–5× worse hack" to native-quality graph-ANN files, by
+letting cuVS build the hierarchy (`cuvsHnswFromCagra`) and faithfully
+re-serializing it into both formats. Gate `p_multilevel`: CheckIndex +
+Java `KnnFloatVectorQuery` (Lucene) and the real jVector library
+(jVector) both open and search our multi-level files with exact top-1.
+Remaining: wire the multi-level hierarchy into the DoPut write path
+(currently single-level small-world) so ingested vectors get it too.
 
 ---
 

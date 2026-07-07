@@ -4,10 +4,10 @@
 //! GPU FlatKnn (Rust); jVector and Lucene HNSW reading the graph *we*
 //! wrote; and jVector and Lucene searching graphs built by their *own*
 //! native builders. The native rows isolate graph quality — is our graph
-//! bad in general, or bad for a specific engine? Our Lucene segment now
-//! carries a real multi-layer hierarchy (CAGRA -> cuvsHnswFromCagra ->
-//! parse -> multi-level .vem/.vex) and lands within ~1.2x of native; the
-//! jVector file is still single-level and lags its native builder.)
+//! bad in general, or bad for a specific engine? Both our files now carry
+//! a real multi-layer hierarchy (CAGRA -> cuvsHnswFromCagra -> parse ->
+//! multi-level Lucene .vem/.vex and jVector OnDiskGraphIndex) and land at
+//! or near their native builders.)
 //! Ground-truth top-k is the FlatKnn exact result; node/doc ids share the
 //! ordinal space, so recall is directly comparable.
 //!
@@ -26,7 +26,7 @@ use lucene_arrow_gpu::cuvs_knn::CuvsContext;
 use lucene_arrow_gpu::knn::FlatKnn;
 use lucene_arrow_vectors::file::VectorsFileBuilder;
 use lucene_arrow_vectors::hnsw::{HnswFilesBuilder, small_world_from_cagra};
-use lucene_arrow_vectors::jvector::write_index;
+use lucene_arrow_vectors::jvector::write_index_multi;
 use lucene_arrow_vectors::{Similarity, VectorEncoding};
 
 const N: usize = 100_000;
@@ -81,9 +81,10 @@ fn main() {
     let parsed =
         lucene_arrow_vectors::hnsw::parse_hnswlib(&std::fs::read(&hfile).unwrap()).unwrap();
 
-    // jVector file.
+    // jVector file — multi-layer, from the same HNSW hierarchy.
     let jv_path = tmp.path().join("graph.jvector");
-    std::fs::write(&jv_path, write_index(&vectors, DIM, &neighbors, 0).unwrap()).unwrap();
+    std::fs::write(&jv_path, write_index_multi(&vectors, DIM, &parsed).unwrap()).unwrap();
+    let _ = &neighbors; // (single-level small-world still available for A/B)
 
     // Lucene HNSW segment (flat + graph).
     let docs: Vec<u32> = (0..N as u32).collect();
