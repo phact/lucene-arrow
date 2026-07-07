@@ -235,13 +235,70 @@ impl CuvsContext {
         ef_construction: i32,
         out_path: &str,
     ) -> Result<()> {
-        use cuvs_sys as ffi;
         let n = vectors.len() / dim;
         let dataset = ndarray::Array2::from_shape_vec((n, dim), vectors.to_vec())
             .map_err(|e| Error::invalid(e.to_string()))?;
         let dataset_dev = ManagedTensor::from(&dataset).to_device(&self.res).map_err(cuvs_err)?;
-        let cpath = std::ffi::CString::new(out_path).map_err(|e| Error::invalid(e.to_string()))?;
+        // Safety: dataset_dev owns the device buffer and outlives the build.
+        unsafe { self.cagra_to_hnswlib_tensor(dataset_dev.as_ptr(), m, ef_construction, out_path) }
+    }
 
+    /// Like [`cagra_to_hnswlib`](Self::cagra_to_hnswlib) but the dataset is
+    /// *already* a contiguous row-major f32 `[n, dim]` buffer on the GPU
+    /// (`data_ptr`) — the fused path where vectors were gathered on-device
+    /// and never round-tripped through host memory. `data_ptr` must stay
+    /// valid (and the extract kernel finished) until this returns.
+    ///
+    /// # Safety
+    /// `data_ptr` points to at least `n * dim` valid device f32s in the
+    /// same CUDA context as `self.res`.
+    pub unsafe fn cagra_to_hnswlib_device(
+        &self,
+        data_ptr: *mut std::os::raw::c_void,
+        n: usize,
+        dim: usize,
+        m: usize,
+        ef_construction: i32,
+        out_path: &str,
+    ) -> Result<()> {
+        use cuvs_sys as ffi;
+        let mut shape = [n as i64, dim as i64];
+        let mut tensor = ffi::DLManagedTensor {
+            dl_tensor: ffi::DLTensor {
+                data: data_ptr,
+                device: ffi::DLDevice { device_type: ffi::DLDeviceType::kDLCUDA, device_id: 0 },
+                ndim: 2,
+                dtype: ffi::DLDataType {
+                    code: ffi::DLDataTypeCode::kDLFloat as u8,
+                    bits: 32,
+                    lanes: 1,
+                },
+                shape: shape.as_mut_ptr(),
+                strides: std::ptr::null_mut(), // contiguous row-major
+                byte_offset: 0,
+            },
+            manager_ctx: std::ptr::null_mut(),
+            deleter: None, // caller owns the buffer; cuVS must not free it
+        };
+        // Safety: tensor + shape live across the call inside.
+        unsafe { self.cagra_to_hnswlib_tensor(&mut tensor, m, ef_construction, out_path) }
+    }
+
+    /// Core: build CAGRA from a dataset `DLManagedTensor`, convert to an
+    /// HNSW hierarchy (hierarchy=CPU → standard hnswlib), serialize.
+    ///
+    /// # Safety
+    /// `dataset` is a valid `DLManagedTensor` whose backing memory lives
+    /// through the CAGRA build.
+    unsafe fn cagra_to_hnswlib_tensor(
+        &self,
+        dataset: *mut cuvs_sys::DLManagedTensor,
+        m: usize,
+        ef_construction: i32,
+        out_path: &str,
+    ) -> Result<()> {
+        use cuvs_sys as ffi;
+        let cpath = std::ffi::CString::new(out_path).map_err(|e| Error::invalid(e.to_string()))?;
         // Safety: C API with valid handles; all created objects destroyed.
         unsafe {
             let mut cparams: ffi::cuvsCagraIndexParams_t = std::ptr::null_mut();
@@ -260,7 +317,7 @@ impl CuvsContext {
             check(ffi::cuvsHnswIndexCreate(&mut hindex))?;
 
             let result = (|| {
-                check(ffi::cuvsCagraBuild(self.res.0, cparams, dataset_dev.as_ptr(), cindex))?;
+                check(ffi::cuvsCagraBuild(self.res.0, cparams, dataset, cindex))?;
                 check(ffi::cuvsHnswFromCagra(self.res.0, hparams, cindex, hindex))?;
                 check(ffi::cuvsHnswSerialize(self.res.0, cpath.as_ptr(), hindex))
             })();

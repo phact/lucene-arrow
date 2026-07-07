@@ -351,3 +351,22 @@ above. Vendored at `vendor/bearing` with one `pub(crate)` → `pub` patch on
 `BlockTreeTermsWriter`. Fork risk priced in: if Bearing stalls, what we'd
 vendor next is small (`.fnm`/`.si`/`segments_N` parsing) — the hard format
 work is already ours.
+
+
+**Fused GPU extract (rebuild-merge at scale).** For merging vector
+indexes (read N jVector files → one CAGRA → one file), the CPU vector
+extract becomes a real cost at realistic dims. Measured 2M × 1536-d
+(12.3 GB, `--example jvector_merge_scale`): CPU read (mmap + parallel
+bswap → host floats) is ~3.5 s warm / ~10 s cold, and the host
+`cagra_to_hnswlib` spends ~half its time re-materializing + uploading the
+12 GB. The fused path — `GpuDecoder::gather_be_f32[_multi]` uploads the
+raw file bytes and byte-swaps the strided BE f32 vectors into a
+contiguous **device** buffer, handed straight to
+`CuvsContext::cagra_to_hnswlib_device` (no host float buffer, no
+round-trip) — runs the whole merge **2.18× faster** (44.8 s → 20.6 s).
+cudarc and cuVS share the CUDA primary context, so the device pointer
+crosses libraries directly. Gate `p_fused_extract`: the GPU gather is
+byte-identical to the CPU reader and the device-fed graph searches top-1
+exact in the real jVector library. Headroom: pinned-staging upload (the
+gather is currently pageable-upload-bound) and GPUDirect Storage to skip
+the CPU on the read path entirely.

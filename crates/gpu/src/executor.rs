@@ -90,6 +90,26 @@ extern "C" __global__ void decode_blocks(
         }
     }
 }
+
+// Gather the inline big-endian f32 vectors out of jVector L0 records into a
+// contiguous device buffer, byte-swapping to native — the fused GPU extract.
+// Record layout: header + node*record, then +4 (nodeId) is the dim-f32
+// vector. Grid-stride over all n*dim floats.
+extern "C" __global__ void gather_be_f32(
+        const unsigned char* raw, unsigned long long header,
+        unsigned long long record, int dim, long long n, float* out) {
+    unsigned long long total = (unsigned long long)n * (unsigned long long)dim;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long t = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         t < total; t += stride) {
+        unsigned long long node = t / (unsigned long long)dim;
+        unsigned long long k = t - node * (unsigned long long)dim;
+        unsigned long long off = header + node * record + 4ULL + k * 4ULL;
+        unsigned int w = *(const unsigned int*)(raw + off);
+        w = __byte_perm(w, 0, 0x0123); // big-endian -> native little-endian
+        out[t] = __int_as_float((int)w);
+    }
+}
 "#;
 
 #[repr(C)]
@@ -114,6 +134,7 @@ pub struct GpuDecoder {
     stream: Arc<CudaStream>,
     _module: Arc<CudaModule>,
     decode_blocks: CudaFunction,
+    gather_be_f32: CudaFunction,
 }
 
 pub(crate) fn cuda_err(e: impl std::fmt::Display) -> Error {
@@ -128,7 +149,111 @@ impl GpuDecoder {
         let ptx = compile_ptx(KERNEL_SRC).map_err(cuda_err)?;
         let module = ctx.load_module(ptx).map_err(cuda_err)?;
         let decode_blocks = module.load_function("decode_blocks").map_err(cuda_err)?;
-        Ok(GpuDecoder { stream: ctx.default_stream(), _module: module, decode_blocks })
+        let gather_be_f32 = module.load_function("gather_be_f32").map_err(cuda_err)?;
+        Ok(GpuDecoder { stream: ctx.default_stream(), _module: module, decode_blocks, gather_be_f32 })
+    }
+
+    /// Fused GPU extract of jVector inline vectors: upload the raw file
+    /// bytes, gather + byte-swap the strided big-endian f32 vectors into a
+    /// contiguous device buffer on the GPU — no CPU bswap, no host float
+    /// materialization. `record` is the L0 record stride in bytes and
+    /// `header` the byte offset of record 0 (both from the jVector header).
+    /// The returned buffer feeds `CuvsContext::cagra_to_hnswlib_device`
+    /// directly (same primary CUDA context). Call [`sync`](Self::sync)
+    /// before handing the pointer to cuVS.
+    pub fn gather_be_f32(
+        &self,
+        raw: &[u8],
+        header: usize,
+        record: usize,
+        dim: usize,
+        n: usize,
+    ) -> Result<cudarc::driver::CudaSlice<f32>> {
+        let d_raw = self.upload(raw)?;
+        let total = n * dim;
+        let mut out = self.stream.alloc_zeros::<f32>(total.max(1)).map_err(cuda_err)?;
+        let block = 256u32;
+        let grid = ((total as u64).div_ceil(block as u64) as u32).clamp(1, 65_535);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (header_u, record_u, dim_i, n_i) = (header as u64, record as u64, dim as i32, n as i64);
+        let mut launch = self.stream.launch_builder(&self.gather_be_f32);
+        launch.arg(&d_raw.dev);
+        launch.arg(&header_u);
+        launch.arg(&record_u);
+        launch.arg(&dim_i);
+        launch.arg(&n_i);
+        launch.arg(&mut out);
+        unsafe { launch.launch(cfg) }.map_err(cuda_err)?;
+        Ok(out)
+    }
+
+    /// Fused GPU extract across several jVector files into ONE contiguous
+    /// device buffer — the merge input for CAGRA, gathered entirely on the
+    /// GPU. Each `files[i]` is `(raw_bytes, header, record, n)`; all share
+    /// `dim`. Returns the combined `[Σn, dim]` device buffer.
+    pub fn gather_be_f32_multi(
+        &self,
+        files: &[(&[u8], usize, usize, usize)],
+        dim: usize,
+    ) -> Result<cudarc::driver::CudaSlice<f32>> {
+        let total: usize = files.iter().map(|&(_, _, _, n)| n * dim).sum();
+        let mut combined = self.stream.alloc_zeros::<f32>(total.max(1)).map_err(cuda_err)?;
+        let mut off = 0usize;
+        for &(raw, header, record, n) in files {
+            let d_raw = self.upload(raw)?;
+            let cnt = n * dim;
+            let block = 256u32;
+            let grid = ((cnt as u64).div_ceil(block as u64) as u32).clamp(1, 65_535);
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let (h, r, di, ni) = (header as u64, record as u64, dim as i32, n as i64);
+            {
+                let mut view = combined.slice_mut(off..off + cnt);
+                let mut launch = self.stream.launch_builder(&self.gather_be_f32);
+                launch.arg(&d_raw.dev);
+                launch.arg(&h);
+                launch.arg(&r);
+                launch.arg(&di);
+                launch.arg(&ni);
+                launch.arg(&mut view);
+                unsafe { launch.launch(cfg) }.map_err(cuda_err)?;
+            }
+            // Sync before dropping d_raw so its device memory is free for the
+            // next file (caps peak VRAM at combined + one raw upload).
+            self.stream.synchronize().map_err(cuda_err)?;
+            drop(d_raw);
+            off += cnt;
+        }
+        Ok(combined)
+    }
+
+    /// Block until all stream work (e.g. [`gather_be_f32`](Self::gather_be_f32))
+    /// completes — required before a raw device pointer is handed to cuVS,
+    /// which runs on its own stream.
+    pub fn sync(&self) -> Result<()> {
+        self.stream.synchronize().map_err(cuda_err)
+    }
+
+    /// Copy a device f32 buffer back to host (for verifying the gather).
+    pub fn download_f32(&self, buf: &cudarc::driver::CudaSlice<f32>) -> Result<Vec<f32>> {
+        let v = self.stream.clone_dtoh(buf).map_err(cuda_err)?;
+        self.stream.synchronize().map_err(cuda_err)?;
+        Ok(v)
+    }
+
+    /// Raw device pointer of a device buffer, for handing to cuVS (same
+    /// primary context). The buffer must outlive the cuVS call.
+    pub fn device_ptr_f32(&self, buf: &cudarc::driver::CudaSlice<f32>) -> *mut std::os::raw::c_void {
+        use cudarc::driver::DevicePtr;
+        let (p, _guard) = buf.device_ptr(&self.stream);
+        p as *mut std::os::raw::c_void
     }
 
     /// Upload a data file (or extent) once for repeated decodes. Adds the

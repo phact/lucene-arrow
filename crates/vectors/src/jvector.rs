@@ -108,6 +108,26 @@ pub fn read_vectors_file(path: &std::path::Path) -> Result<(Vec<f32>, usize)> {
     read_vectors(&mmap)
 }
 
+/// The dense level-0 record layout of a jVector v5 file:
+/// `(header_offset, record_bytes, dim, count)` — enough to gather the
+/// inline vectors on the GPU (see `GpuDecoder::gather_be_f32`). Assumes a
+/// dense file (no holes); holed files must use [`read_vectors`] on the CPU.
+pub fn l0_layout(bytes: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    let i32be = |o: usize| -> Result<i32> {
+        bytes
+            .get(o..o + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| Error::corrupt("jvector: truncated"))
+    };
+    if i32be(0)? != MAGIC {
+        return Err(Error::invalid("not a jVector index (bad magic)"));
+    }
+    let dim = i32be(12)? as usize;
+    let degree0 = i32be(20)? as usize;
+    let n = i32be(24)? as usize;
+    Ok((JV_HEADER, 4 + dim * 4 + 4 + degree0 * 4, dim, n))
+}
+
 /// Read the inline f32 vectors out of a jVector `OnDiskGraphIndex` v5 file
 /// (big-endian), in ordinal order — the input for a GPU rebuild-merge.
 /// Returns `(vectors_flat, dim)`. Reads only the dense level-0 records'
