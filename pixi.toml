@@ -1,0 +1,21 @@
+# GPU-native dependencies (SPEC §3.7): RAPIDS libs pinned via pixi — the
+# Sirius pattern. Rust links against this env's prefix; no system installs.
+#
+#   pixi install            # solve + fetch into .pixi/envs/default
+#   pixi run print-prefix   # the CMAKE_PREFIX_PATH for the cuvs crate
+
+[workspace]
+name = "lucene-arrow-gpu-deps"
+channels = ["rapidsai", "conda-forge", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+# cuVS C/C++ library + headers (CAGRA, brute force). CUDA 12 line to match
+# the local driver (12.9) — see SPEC §3.7.
+libcuvs = "*"
+cuda-version = "12.9.*"
+cmake = ">=3.26"
+ninja = "*"
+
+[tasks]
+print-prefix = "echo $CONDA_PREFIX"
