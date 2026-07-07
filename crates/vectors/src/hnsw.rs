@@ -69,6 +69,12 @@ pub fn navigable_from_knn(graph: &[u32], n: usize, degree: usize, cap: usize) ->
 /// find neighbors. (Measured: raw CAGRA graph ≈ 1% recall@10 at 100k;
 /// with this augmentation ≈ 98%.)
 pub fn small_world_from_cagra(graph: &[u32], n: usize, degree: usize, cap: usize) -> Vec<Vec<u32>> {
+    // A small fixed number of long-range shortcuts (cap/4) gives the graph
+    // small-world connectivity. NOTE: measured — scaling this *up* with n
+    // hurts recall, because the shortcuts trade against local edges within
+    // the fixed degree cap, and local edges are what let greedy search pin
+    // down the exact nearest. The levers for recall at scale are the search
+    // beam (ef) and the degree cap, not the shortcut count.
     let long_range = (cap / 4).max(2);
     let keep = cap.saturating_sub(long_range);
     let mut neighbors: Vec<Vec<u32>> = (0..n)
