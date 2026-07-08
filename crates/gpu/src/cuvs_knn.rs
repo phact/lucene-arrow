@@ -222,6 +222,16 @@ impl CuvsContext {
         }
     }
 
+    /// Scratch directory for the transient hnswlib serialize file. Prefer
+    /// `/dev/shm` (tmpfs): `cuvsHnswSerialize` writes the *whole dataset*
+    /// (hnswlib embeds the vectors — GBs at scale), and the ext4 write +
+    /// read-back measured 3.6–7.9 s for 12.6 GB with high variance, vs
+    /// RAM-speed on tmpfs. Falls back to the system temp dir.
+    pub fn hnsw_scratch_dir() -> std::path::PathBuf {
+        let shm = std::path::Path::new("/dev/shm");
+        if shm.is_dir() { shm.to_path_buf() } else { std::env::temp_dir() }
+    }
+
     /// Build a CAGRA index, convert it to a **multi-layer HNSW hierarchy**
     /// on the CPU (`cuvsHnswFromCagra`, hierarchy=CPU → standard hnswlib
     /// format), and serialize to `out_path`. The result is a proper HNSW
@@ -310,16 +320,38 @@ impl CuvsContext {
 
             let mut hparams: ffi::cuvsHnswIndexParams_t = std::ptr::null_mut();
             check(ffi::cuvsHnswIndexParamsCreate(&mut hparams))?;
-            (*hparams).hierarchy = ffi::cuvsHnswHierarchy::CPU;
+            // LA_HNSW_HIERARCHY=gpu: experimental — cuVS builds the level
+            // assignment on the GPU (probing whether the serialized format
+            // stays hnswlib-compatible; CPU is the verified default).
+            (*hparams).hierarchy = match std::env::var("LA_HNSW_HIERARCHY").as_deref() {
+                Ok("gpu") => ffi::cuvsHnswHierarchy::GPU,
+                _ => ffi::cuvsHnswHierarchy::CPU,
+            };
             (*hparams).M = m;
             (*hparams).ef_construction = ef_construction;
             let mut hindex: ffi::cuvsHnswIndex_t = std::ptr::null_mut();
             check(ffi::cuvsHnswIndexCreate(&mut hindex))?;
 
+            // LA_TIMING=1 prints the per-stage split (GPU graph build vs CPU
+            // hierarchy insert vs serialize-to-disk) — the three have very
+            // different optimization levers, so never tune the lump.
+            let timing = std::env::var_os("LA_TIMING").is_some();
+            let stage = |label: &str, t: std::time::Instant| {
+                if timing {
+                    eprintln!("  [timing] {label:<22}: {:8.3} s", t.elapsed().as_secs_f64());
+                }
+            };
             let result = (|| {
+                let t = std::time::Instant::now();
                 check(ffi::cuvsCagraBuild(self.res.0, cparams, dataset, cindex))?;
+                stage("cuvsCagraBuild (GPU)", t);
+                let t = std::time::Instant::now();
                 check(ffi::cuvsHnswFromCagra(self.res.0, hparams, cindex, hindex))?;
-                check(ffi::cuvsHnswSerialize(self.res.0, cpath.as_ptr(), hindex))
+                stage("cuvsHnswFromCagra (CPU)", t);
+                let t = std::time::Instant::now();
+                check(ffi::cuvsHnswSerialize(self.res.0, cpath.as_ptr(), hindex))?;
+                stage("cuvsHnswSerialize (IO)", t);
+                Ok(())
             })();
 
             let _ = ffi::cuvsHnswIndexDestroy(hindex);

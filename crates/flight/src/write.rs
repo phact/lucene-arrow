@@ -802,16 +802,18 @@ fn build_graph(data: &[f32], dim: usize) -> Result<lucene_arrow_vectors::hnsw::H
             .map_err(|e| Error::invalid(format!("vector ingest needs a GPU at this size: {e}")))?;
         // CAGRA → cuVS HNSW hierarchy (hierarchy=CPU → standard hnswlib) →
         // parse → multi-level graph (near-native recall/QPS; see vectors::hnsw).
-        let tmp = std::env::temp_dir().join(format!(
+        // Serialize lands on /dev/shm when available (the file embeds all
+        // vectors) and the parse mmaps it — no disk round-trip, no Vec copy.
+        let tmp = lucene_arrow_gpu::cuvs_knn::CuvsContext::hnsw_scratch_dir().join(format!(
             "la_hnsw_{}_{}.bin",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let path = tmp.to_str().ok_or_else(|| Error::invalid("non-utf8 temp path"))?;
         ctx.cagra_to_hnswlib(data, dim, degree / 2, 100, path)?;
-        let bytes = std::fs::read(&tmp).map_err(|e| Error::invalid(e.to_string()))?;
+        let parsed = lucene_arrow_vectors::hnsw::parse_hnswlib_file(&tmp);
         let _ = std::fs::remove_file(&tmp);
-        lucene_arrow_vectors::hnsw::parse_hnswlib(&bytes)
+        parsed
     }
     #[cfg(not(feature = "cuvs"))]
     Err(Error::invalid("vector ingest needs the cuvs build for segments > 4096 docs"))

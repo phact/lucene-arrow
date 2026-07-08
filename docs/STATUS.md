@@ -384,3 +384,23 @@ and is **Unsupported** on this box: consumer GeForce reports
 `NVMe P2PDMA: Unsupported`, so cuFile only offers host-bounce
 compatibility mode (no benefit). libcufile + ext4/NVMe are fine; the
 P2PDMA capability is the gate. So pinned staging is the ceiling here.
+
+**Phase-split + the real bottleneck** (`LA_TIMING=1`). "CAGRA build" was
+three stages lumped; at 2M × 1536 the split is: `cuvsCagraBuild` (GPU)
+6.4 s stable │ `cuvsHnswFromCagra` (CPU hierarchy insert) ~9 s │
+`cuvsHnswSerialize` 3.6–7.9 s *and the whole run-to-run variance* — it
+writes the full 12.6 GB hnswlib image (vectors embedded) to ext4. Fixes
+landed: serialize to **/dev/shm** (`hnsw_scratch_dir`; 2.1–2.2 s, stable)
+and **mmap the parse** (`parse_hnswlib_file`) instead of a 12.6 GB
+`fs::read` copy — fused merge 20.6 → **15.7 s**. The hierarchy-insert
+knob `ef_construction` measured: 100 → 40 cuts the CPU stage 9.0 → 5.9 s
+with recall **0.990** (vs 0.986) at the 100k gate — free at measurable
+scale; ingest default stays 100 (2M+ recall unverified), EFC env on the
+merge example/bench. Tested and rejected: `hierarchy=GPU`
+(`LA_HNSW_HIERARCHY=gpu`) — serializes parseably and passes the 5k gate,
+but at 6k/128-d clustered data an exact-member query returns ten hits
+from the *wrong cluster* (greedy stuck in a bad basin, deterministic):
+format-compatible, navigationally broken. CPU hierarchy stays the
+default. Remaining merge split at EFC=40: CAGRA-GPU 6.4 │ hierarchy 5.9 │
+serialize 2.2 │ gather 0.8 — further wins mean faster cuVS graph
+construction, not IO.

@@ -121,6 +121,15 @@ pub struct HnswParsed {
     pub levels: Vec<Vec<(u32, Vec<u32>)>>,
 }
 
+/// `mmap` + parse a standard hnswlib index file — avoids copying the file
+/// (which embeds all the vectors, so it's GBs at scale) into a `Vec` first.
+pub fn parse_hnswlib_file(path: &std::path::Path) -> Result<HnswParsed> {
+    let file = std::fs::File::open(path).map_err(|e| Error::invalid(e.to_string()))?;
+    // Safety: read-only view; the file is not mutated for the map's lifetime.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| Error::invalid(e.to_string()))?;
+    parse_hnswlib(&mmap)
+}
+
 /// Parse a standard hnswlib `saveIndex` byte image into a multi-level
 /// graph. Layout (little-endian): a 96-byte header, then a level-0 block
 /// per element (`[u16 count | .. ] + maxM0 u32 links + vector data + u64

@@ -17,7 +17,7 @@ use lucene_arrow_gpu::GpuDecoder;
 #[cfg(feature = "cuvs")]
 use lucene_arrow_gpu::cuvs_knn::CuvsContext;
 #[cfg(feature = "cuvs")]
-use lucene_arrow_vectors::hnsw::parse_hnswlib;
+use lucene_arrow_vectors::hnsw::parse_hnswlib_file;
 #[cfg(feature = "cuvs")]
 use lucene_arrow_vectors::jvector::{l0_layout, read_vectors_file, write_index, write_index_multi};
 
@@ -34,6 +34,7 @@ fn main() {
     #[cfg(feature = "cuvs")]
     {
         let dim = env("DIM", 1536);
+        let efc = env("EFC", 100) as i32; // hierarchy-insert candidate list
         let n = env("N", 2_000_000);
         let src = env("SRC", 4);
         let per = n / src;
@@ -91,12 +92,17 @@ fn main() {
         let read_warm_s = t.elapsed().as_secs_f64();
         drop(warm);
 
-        // --- HOST REBUILD: CAGRA -> HNSW (host floats uploaded internally) ---
-        let hf = dir.join("merged.hnsw");
+        // --- HOST REBUILD: CAGRA -> HNSW (host floats uploaded internally).
+        //     Serialize target is /dev/shm (tmpfs) when present — the
+        //     hnswlib file embeds the vectors, so on disk it's a full-size
+        //     write + read-back; parse mmaps it. ---
+        let scratch = CuvsContext::hnsw_scratch_dir();
+        let hf = scratch.join("la_merged.hnsw");
         let t = Instant::now();
-        ctx.cagra_to_hnswlib(&all, dim, 16, 100, hf.to_str().unwrap()).unwrap();
+        ctx.cagra_to_hnswlib(&all, dim, 16, efc, hf.to_str().unwrap()).unwrap();
         let build_host_s = t.elapsed().as_secs_f64();
-        let parsed = parse_hnswlib(&std::fs::read(&hf).unwrap()).unwrap();
+        let parsed = parse_hnswlib_file(&hf).unwrap();
+        std::fs::remove_file(&hf).unwrap(); // don't leave GBs in tmpfs
         let _ = write_index_multi(&all, dim, &parsed).unwrap();
         drop(all); // free ~n*dim*4 host bytes before the fused pass
 
@@ -113,12 +119,13 @@ fn main() {
         let t = Instant::now();
         let dev = gpu.gather_be_f32_multi(&layouts, dim).unwrap();
         let gather_s = t.elapsed().as_secs_f64();
-        let hf2 = dir.join("merged_fused.hnsw");
+        let hf2 = scratch.join("la_merged_fused.hnsw");
         let t = Instant::now();
         let ptr = gpu.device_ptr_f32(&dev);
         // Safety: dev outlives the call; same primary context; gather synced.
-        unsafe { ctx.cagra_to_hnswlib_device(ptr, n, dim, 16, 100, hf2.to_str().unwrap()).unwrap() };
+        unsafe { ctx.cagra_to_hnswlib_device(ptr, n, dim, 16, efc, hf2.to_str().unwrap()).unwrap() };
         let build_dev_s = t.elapsed().as_secs_f64();
+        std::fs::remove_file(&hf2).unwrap();
         drop(dev);
 
         let gb = (n * dim * 4) as f64 / 1e9;

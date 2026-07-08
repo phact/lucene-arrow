@@ -77,7 +77,8 @@ fn main() {
     // hierarchy (hierarchy=CPU, standard hnswlib) → parse → our multi-level
     // .vem/.vex writer.
     let hfile = tmp.path().join("h.hnsw");
-    ctx.cagra_to_hnswlib(&vectors, DIM, DEGREE / 2, 100, hfile.to_str().unwrap()).unwrap();
+    let efc: i32 = std::env::var("EFC").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    ctx.cagra_to_hnswlib(&vectors, DIM, DEGREE / 2, efc, hfile.to_str().unwrap()).unwrap();
     let parsed =
         lucene_arrow_vectors::hnsw::parse_hnswlib(&std::fs::read(&hfile).unwrap()).unwrap();
 
