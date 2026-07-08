@@ -23,12 +23,14 @@ Full phase-by-phase status and benchmark methodology: [`docs/STATUS.md`](docs/ST
 - **Write** — Arrow → CheckIndex-clean segment: the full §10.2 coercion matrix
   (numeric family, strings, lists, binary, strict + explicit-lossy), on CPU or
   GPU, byte-identical to Java Lucene.
-- **Vectors** — flat vectors both directions; GPU-built HNSW graphs
-  (NN-Descent / CAGRA) serialized to Lucene `.vem`/`.vex` and jVector
-  `OnDiskGraphIndex`, each verified by the real Java / jVector library.
+- **Vectors** — flat vectors both directions; GPU-built **multi-level** HNSW
+  graphs (CAGRA → cuVS hierarchy) serialized to Lucene `.vem`/`.vex` and
+  jVector `OnDiskGraphIndex` at native-builder search quality, each verified by
+  the real Java / jVector library; GPU **rebuild-merge** of N jVector indexes
+  into one (fused on-device extract).
 - **Postings & BM25** — full block-tree terms/postings reader → `term|doc|freq`
   relation; markdown → BM25-scored Lucene segments with live Java score parity;
-  GPU tokenization and GPU BM25 scoring.
+  GPU tokenization and batched GPU BM25 scoring with device-side top-k.
 - **Flight** — Arrow Flight front door: `DoGet` (row modes, projection, dict
   handling, CPU/GPU executor), `DoPut` (Arrow → segments), `DoAction` (hydrate,
   stats), and the postings relation.
@@ -149,6 +151,7 @@ fill in when available; `QUICK=1` for a fast smoke run).
 | doc-values read, GPU kernels only | 48.7 Gvals/s | — | 154× | `--bench gpu_decode` |
 | doc-values **write** (DoPut, GPU stats+pack, zero-copy dense lane) | 26.1 Mdocs/s | 4.09 Mdocs/s | **6.4×** | `--bench write_bench` / `BenchIngest` |
 | **HNSW indexing** (200k×128, graph + segment) | 1.06 s | 9.49 s | **9.0×** | `--bench hnsw_build` / `BenchKnnIngest` |
+| **ANN search** over our multi-level graph (100k×128, ef=100) | 16.2k qps @ 0.99 recall | 15.7–18.8k qps (native builders) | ≈ native | `--bench vector_search` |
 | **postings scan** (12M postings, same checksum) | 462 Mpostings/s | 360 Mpostings/s | 1.27× | `--bench csr_bench` / `BenchText scan` |
 | postings decode, GPU doc-block kernel | 37 Gdocs/s | — | ~100× | `--bench postings_gpu` |
 | **BM25 ingest** (arXiv markdown, 46 MB), CPU | 227 MB/s | 35 MB/s | **6.5×** | `--bench bm25_ingest` / `BenchMdIngest` |
