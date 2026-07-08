@@ -45,6 +45,26 @@ pub trait NumericEncoder {
         gcd: i64,
         table: Option<&[i64]>,
     ) -> Result<Vec<u8>>;
+
+    /// [`stats`](Self::stats) over a logically-concatenated chunk list —
+    /// the zero-copy ingest lane hands Arrow batch slices straight through
+    /// instead of materializing one host Vec. MUST equal `stats(concat)`.
+    fn stats_chunks(&self, chunks: &[&[i64]]) -> Result<NumericStats> {
+        self.stats(&chunks.concat())
+    }
+
+    /// [`pack`](Self::pack) over the same chunk list. MUST equal
+    /// `pack(concat, ..)` byte-for-byte.
+    fn pack_chunks(
+        &self,
+        chunks: &[&[i64]],
+        bpv: u8,
+        base: i64,
+        gcd: i64,
+        table: Option<&[i64]>,
+    ) -> Result<Vec<u8>> {
+        self.pack(&chunks.concat(), bpv, base, gcd, table)
+    }
 }
 
 /// The reference executor (SPEC §3.5).
@@ -101,6 +121,65 @@ impl NumericEncoder for CpuEncoder {
         direct::pack(&encoded, bpv, &mut out);
         Ok(out)
     }
+
+    fn stats_chunks(&self, chunks: &[&[i64]]) -> Result<NumericStats> {
+        // Same fold as `stats`, streamed across chunks (no concat).
+        let first_value = chunks[0][0];
+        let mut min = first_value;
+        let mut max = first_value;
+        let mut gcd: i64 = 0;
+        let mut unique: Option<BTreeSet<i64>> = Some(BTreeSet::new());
+        for &v in chunks.iter().copied().flatten() {
+            min = min.min(v);
+            max = max.max(v);
+            if gcd != 1 {
+                if !(i64::MIN / 2..=i64::MAX / 2).contains(&v) {
+                    gcd = 1;
+                } else {
+                    gcd = gcd_compute(gcd, v.wrapping_sub(first_value));
+                }
+            }
+            if let Some(set) = unique.as_mut() {
+                set.insert(v);
+                if set.len() > 256 {
+                    unique = None;
+                }
+            }
+        }
+        Ok(NumericStats { min, max, gcd, table: unique.map(|s| s.into_iter().collect()) })
+    }
+
+    fn pack_chunks(
+        &self,
+        chunks: &[&[i64]],
+        bpv: u8,
+        base: i64,
+        gcd: i64,
+        table: Option<&[i64]>,
+    ) -> Result<Vec<u8>> {
+        // One transform pass over the chunks into the pre-pack buffer —
+        // the single alloc `pack` would have done anyway.
+        let n: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut encoded: Vec<i64> = Vec::with_capacity(n);
+        match table {
+            Some(t) => {
+                for &v in chunks.iter().copied().flatten() {
+                    let i = t
+                        .binary_search(&v)
+                        .map_err(|_| Error::invalid("value missing from table"))?;
+                    encoded.push(i as i64);
+                }
+            }
+            None => {
+                for &v in chunks.iter().copied().flatten() {
+                    encoded.push(v.wrapping_sub(base).wrapping_div(gcd));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        direct::pack(&encoded, bpv, &mut out);
+        Ok(out)
+    }
 }
 
 /// One encoded field: `meta` is the `.dvm` entry (field number + type byte
@@ -124,6 +203,64 @@ pub fn encode_numeric_field(
     dvd_base: u64,
 ) -> Result<EncodedField> {
     encode_numeric_field_with(&CpuEncoder, field_number, docs, values, max_doc, dvd_base)
+}
+
+/// Value stream for [`write_values`]: one flat slice, or the zero-copy
+/// lane's list of Arrow batch slices (logically concatenated).
+pub enum ValuesIn<'a> {
+    Flat(&'a [i64]),
+    Chunks(&'a [&'a [i64]]),
+}
+
+impl ValuesIn<'_> {
+    fn len(&self) -> usize {
+        match self {
+            ValuesIn::Flat(v) => v.len(),
+            ValuesIn::Chunks(c) => c.iter().map(|c| c.len()).sum(),
+        }
+    }
+    fn stats(&self, e: &dyn NumericEncoder) -> Result<NumericStats> {
+        match self {
+            ValuesIn::Flat(v) => e.stats(v),
+            ValuesIn::Chunks(c) => e.stats_chunks(c),
+        }
+    }
+    fn pack(
+        &self,
+        e: &dyn NumericEncoder,
+        bpv: u8,
+        base: i64,
+        gcd: i64,
+        table: Option<&[i64]>,
+    ) -> Result<Vec<u8>> {
+        match self {
+            ValuesIn::Flat(v) => e.pack(v, bpv, base, gcd, table),
+            ValuesIn::Chunks(c) => e.pack_chunks(c, bpv, base, gcd, table),
+        }
+    }
+}
+
+/// Encode one **dense** NUMERIC field straight from Arrow batch slices —
+/// the zero-copy ingest lane. Every doc has a value (`Σ chunks == max_doc`),
+/// so no docs array is ever materialized. Byte-identical to
+/// [`encode_numeric_field_with`] on the concatenation.
+pub fn encode_numeric_field_dense_chunks(
+    encoder: &dyn NumericEncoder,
+    field_number: i32,
+    chunks: &[&[i64]],
+    max_doc: u32,
+    dvd_base: u64,
+) -> Result<EncodedField> {
+    let n: usize = chunks.iter().map(|c| c.len()).sum();
+    if n != max_doc as usize {
+        return Err(Error::invalid(format!("dense chunks: {n} values != max_doc {max_doc}")));
+    }
+    let mut meta = Vec::new();
+    let mut data = Vec::new();
+    meta.extend_from_slice(&field_number.to_le_bytes());
+    meta.push(crate::consts::TYPE_NUMERIC);
+    write_values(&mut meta, &mut data, &ValuesIn::Chunks(chunks), &[], max_doc, dvd_base, encoder)?;
+    Ok(EncodedField { meta, data })
 }
 
 /// [`encode_numeric_field`] with an explicit executor (CPU reference or
@@ -153,22 +290,25 @@ pub fn encode_numeric_field_with(
     let mut data = Vec::new();
     meta.extend_from_slice(&field_number.to_le_bytes());
     meta.push(crate::consts::TYPE_NUMERIC);
-    write_values(&mut meta, &mut data, values, docs, max_doc, dvd_base, encoder)?;
+    write_values(&mut meta, &mut data, &ValuesIn::Flat(values), docs, max_doc, dvd_base, encoder)?;
     Ok(EncodedField { meta, data })
 }
 
 /// The `writeValues` body shared by NUMERIC (and later SORTED_NUMERIC).
+/// For [`ValuesIn::Chunks`] callers, `docs` is empty and the field is
+/// dense (`vals.len() == max_doc`); flat callers pass real docids.
 fn write_values(
     meta: &mut Vec<u8>,
     data: &mut Vec<u8>,
-    all_values: &[i64],
+    vals: &ValuesIn<'_>,
     docs: &[u32],
     max_doc: u32,
     dvd_base: u64,
     encoder: &dyn NumericEncoder,
 ) -> Result<()> {
-    let num_values = all_values.len() as i64;
-    let num_docs_with_value = docs.len() as u32;
+    let num_values = vals.len() as i64;
+    let num_docs_with_value =
+        if docs.is_empty() && num_values == max_doc as i64 { max_doc } else { docs.len() as u32 };
 
     // Docs-with-field indicator (IndexedDISI metadata).
     if num_docs_with_value == 0 {
@@ -205,7 +345,7 @@ fn write_values(
     }
 
     // Stats: min, max, gcd, unique values (≤256) — executor-computed.
-    let stats = encoder.stats(all_values)?;
+    let stats = vals.stats(encoder)?;
     let (mut min, max) = (stats.min, stats.max);
     let mut gcd = stats.gcd;
     let unique = stats.table;
@@ -250,13 +390,7 @@ fn write_values(
     meta.extend_from_slice(&(start_offset as i64).to_le_bytes());
 
     if num_bits_per_value > 0 {
-        let payload = encoder.pack(
-            all_values,
-            num_bits_per_value,
-            min,
-            gcd,
-            encode_table.as_deref(),
-        )?;
+        let payload = vals.pack(encoder, num_bits_per_value, min, gcd, encode_table.as_deref())?;
         data.extend_from_slice(&payload);
     }
 
@@ -482,7 +616,7 @@ pub fn encode_sorted_field(
     let mut data = Vec::new();
     meta.extend_from_slice(&field_number.to_le_bytes());
     meta.push(crate::consts::TYPE_SORTED);
-    write_values(&mut meta, &mut data, &ords, docs, max_doc, dvd_base, encoder)?;
+    write_values(&mut meta, &mut data, &ValuesIn::Flat(&ords), docs, max_doc, dvd_base, encoder)?;
     add_terms_dict(&mut meta, &mut data, &sorted, dvd_base)?;
     Ok(EncodedField { meta, data })
 }
@@ -609,7 +743,7 @@ pub fn encode_sorted_numeric_field(
     let mut data = Vec::new();
     meta.extend_from_slice(&field_number.to_le_bytes());
     meta.push(crate::consts::TYPE_SORTED_NUMERIC);
-    write_values(&mut meta, &mut data, &all, docs, max_doc, dvd_base, encoder)?;
+    write_values(&mut meta, &mut data, &ValuesIn::Flat(&all), docs, max_doc, dvd_base, encoder)?;
     meta.extend_from_slice(&(n as i32).to_le_bytes());
     if all.len() > n {
         let mut cumulative = 0i64;
@@ -664,7 +798,7 @@ pub fn encode_sorted_set_field(
     meta.push(u8::from(multi));
 
     let all: Vec<i64> = per_doc_ords.iter().flatten().copied().collect();
-    write_values(&mut meta, &mut data, &all, docs, max_doc, dvd_base, encoder)?;
+    write_values(&mut meta, &mut data, &ValuesIn::Flat(&all), docs, max_doc, dvd_base, encoder)?;
     if multi {
         meta.extend_from_slice(&(docs.len() as i32).to_le_bytes());
         let mut cumulative = 0i64;

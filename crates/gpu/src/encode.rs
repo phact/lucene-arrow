@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 
 use crate::executor::{GpuDecoder, cuda_err};
@@ -169,6 +169,10 @@ pub struct GpuPacker {
     _module: Arc<CudaModule>,
     pack: CudaFunction,
     stats: CudaFunction,
+    /// Cacheable pinned staging for value uploads — the upload is the
+    /// dominant per-field cost, and pageable htod runs ~4× slower than
+    /// the pinned ring (measured on the decode path, SPEC §11.2).
+    ring: crate::executor::PinnedRing,
     /// A field encodes as stats-then-pack over the same slice — cache the
     /// upload between the two trait calls.
     cached: RefCell<Option<(usize, usize, CudaSlice<i64>)>>,
@@ -181,11 +185,26 @@ impl GpuPacker {
         let module = stream.context().load_module(ptx).map_err(cuda_err)?;
         let pack = module.load_function("pack_words").map_err(cuda_err)?;
         let stats = module.load_function("stats_kernel").map_err(cuda_err)?;
-        Ok(GpuPacker { stream, _module: module, pack, stats, cached: RefCell::new(None) })
+        let ring = crate::executor::PinnedRing::new(&stream, 32 << 20, 4)?;
+        Ok(GpuPacker { stream, _module: module, pack, stats, ring, cached: RefCell::new(None) })
     }
 
     pub fn upload_values(&self, values: &[i64]) -> Result<CudaSlice<i64>> {
-        self.stream.clone_htod(values).map_err(cuda_err)
+        // Pinned-ring upload of the raw bytes, then a device-device copy
+        // into an owned i64 buffer (dtod runs at HBM speed — negligible
+        // next to the PCIe transfer it rides behind).
+        // Safety: i64 → u8 reinterpret of an initialized slice.
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        };
+        let d_u8 = self.ring.upload(&self.stream, bytes)?;
+        let mut out: CudaSlice<i64> =
+            self.stream.alloc_zeros(values.len()).map_err(cuda_err)?;
+        // Safety: d_u8 holds len*8 (+8 slack) initialized bytes.
+        let view = unsafe { d_u8.transmute::<i64>(values.len()) }
+            .ok_or_else(|| cuda_err("transmute size mismatch"))?;
+        self.stream.memcpy_dtod(&view, &mut out).map_err(cuda_err)?;
+        Ok(out)
     }
 
     /// Upload and remember (used by `stats`, which always runs first for
@@ -208,6 +227,37 @@ impl GpuPacker {
             return Ok(dev);
         }
         self.upload_values(values)
+    }
+
+    /// Upload a chunk list as one contiguous device i64 buffer — each Arrow
+    /// batch slice DMAs through the pinned ring at its offset; no host
+    /// concatenation ever exists.
+    fn upload_chunks(&self, chunks: &[&[i64]]) -> Result<CudaSlice<i64>> {
+        let n: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut dev: CudaSlice<i64> = self.stream.alloc_zeros(n.max(1)).map_err(cuda_err)?;
+        {
+            let (dptr, _sync_on_drop) = dev.device_ptr_mut(&self.stream);
+            let mut off = 0u64;
+            for chunk in chunks {
+                // Safety: i64 → u8 reinterpret of an initialized slice.
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        chunk.as_ptr() as *const u8,
+                        std::mem::size_of_val(*chunk),
+                    )
+                };
+                // Safety: dst range within dev (Σ chunk lens == n).
+                unsafe { self.ring.upload_into(&self.stream, dptr + off, bytes)? };
+                off += bytes.len() as u64;
+            }
+        }
+        self.stream.synchronize().map_err(cuda_err)?;
+        Ok(dev)
+    }
+
+    fn chunks_key(chunks: &[&[i64]]) -> (usize, usize) {
+        let n: usize = chunks.iter().map(|c| c.len()).sum();
+        (chunks.first().map(|c| c.as_ptr() as usize).unwrap_or(0), n)
     }
 
     /// Device-side stats (SPEC §11.7 stats pass).
@@ -327,14 +377,22 @@ impl GpuPacker {
         let host_words = self.stream.clone_dtoh(words).map_err(cuda_err)?;
         self.stream.synchronize().map_err(cuda_err)?;
         let payload_len = direct::packed_len(count, bpv);
-        let mut out = Vec::with_capacity(payload_len + 8);
-        for w in &host_words {
-            out.extend_from_slice(&w.to_le_bytes());
-        }
-        // alloc_zeros guarantees zero tail bits, so truncate/resize is
-        // exactly DirectWriter's zero padding.
-        out.truncate(payload_len);
-        out.resize(payload_len, 0);
+        // Little-endian target: the u64 words ARE the payload bytes — one
+        // bulk memcpy instead of a per-word to_le_bytes loop (which was
+        // ~1/3 of GPU encode wall at 208 MB). alloc_zeros guarantees zero
+        // tail bits, so the truncation edge is DirectWriter's zero padding.
+        #[cfg(not(target_endian = "little"))]
+        compile_error!("words_to_payload assumes a little-endian host");
+        // Safety: initialized Vec<u64> viewed as bytes.
+        let src: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                host_words.as_ptr() as *const u8,
+                host_words.len() * 8,
+            )
+        };
+        let mut out = vec![0u8; payload_len];
+        let n = payload_len.min(src.len());
+        out[..n].copy_from_slice(&src[..n]);
         Ok(out)
     }
 
@@ -364,8 +422,64 @@ impl NumericEncoder for GpuPacker {
         gcd: i64,
         table: Option<&[i64]>,
     ) -> Result<Vec<u8>> {
+        // bpv=64 (gcd 1, no table) degenerates to `(v - base) as u64` per
+        // word — direct::pack's own math at full width. One CPU pass beats
+        // an upload + kernel + 8 B/value download round-trip, and
+        // full-width fields are the largest payloads (base is usually the
+        // field min, so nonzero — match the general form, not just 0).
+        if bpv == 64 && gcd == 1 && table.is_none() {
+            let _ = self.cached.borrow_mut().take(); // upload not needed
+            #[cfg(not(target_endian = "little"))]
+            compile_error!("identity pack assumes a little-endian host");
+            let mut out = vec![0u8; values.len() * 8];
+            for (dst, v) in out.chunks_exact_mut(8).zip(values) {
+                dst.copy_from_slice(&v.wrapping_sub(base).to_le_bytes());
+            }
+            return Ok(out);
+        }
         let dev = self.take_cached(values)?;
         let words = self.pack_device_table(&dev, values.len() as u64, bpv, base, gcd, table)?;
         self.words_to_payload(&words, values.len(), bpv)
+    }
+
+    fn stats_chunks(&self, chunks: &[&[i64]]) -> Result<NumericStats> {
+        let n: usize = chunks.iter().map(|c| c.len()).sum();
+        let dev = self.upload_chunks(chunks)?;
+        *self.cached.borrow_mut() = {
+            let (p, l) = Self::chunks_key(chunks);
+            Some((p, l, dev.clone()))
+        };
+        self.stats_device(&dev, n as u64)
+    }
+
+    fn pack_chunks(
+        &self,
+        chunks: &[&[i64]],
+        bpv: u8,
+        base: i64,
+        gcd: i64,
+        table: Option<&[i64]>,
+    ) -> Result<Vec<u8>> {
+        let n: usize = chunks.iter().map(|c| c.len()).sum();
+        // Same full-width degenerate case as `pack` — one host pass.
+        if bpv == 64 && gcd == 1 && table.is_none() {
+            let _ = self.cached.borrow_mut().take();
+            let mut out = vec![0u8; n * 8];
+            let mut dst = out.chunks_exact_mut(8);
+            for &v in chunks.iter().copied().flatten() {
+                dst.next().unwrap().copy_from_slice(&v.wrapping_sub(base).to_le_bytes());
+            }
+            return Ok(out);
+        }
+        let key = Self::chunks_key(chunks);
+        let dev = if let Some((p, l, dev)) = self.cached.borrow_mut().take()
+            && (p, l) == key
+        {
+            dev
+        } else {
+            self.upload_chunks(chunks)?
+        };
+        let words = self.pack_device_table(&dev, n as u64, bpv, base, gcd, table)?;
+        self.words_to_payload(&words, n, bpv)
     }
 }

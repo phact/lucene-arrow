@@ -67,8 +67,12 @@ fn main() {
     for batch in &batches {
         session.push(batch).unwrap();
     }
+    let push_s = t.elapsed().as_secs_f64();
+    let tf = Instant::now();
     let manifests = session.finish().unwrap();
+    let finish_s = tf.elapsed().as_secs_f64();
     let secs = t.elapsed().as_secs_f64();
+    eprintln!("  split: push (Arrow→buffers) {push_s:.3} s, finish (encode+files) {finish_s:.3} s");
 
     let total_bytes: u64 = manifests
         .iter()

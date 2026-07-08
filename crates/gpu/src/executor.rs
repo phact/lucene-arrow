@@ -519,45 +519,13 @@ impl GpuDecoder {
     /// at memory speed while DMA runs just as fast — hence the raw driver
     /// calls here.
     pub fn new_pinned_ring(&self, chunk_bytes: usize, depth: usize) -> Result<PinnedRing> {
-        let ctx = self.stream.context().clone();
-        let mut bufs = Vec::with_capacity(depth);
-        for _ in 0..depth {
-            // Safety: sized allocation, freed in Drop; flags=0 → cacheable.
-            let ptr = unsafe { cu::malloc_host(chunk_bytes, 0) }.map_err(cuda_err)? as *mut u8;
-            let event = ctx
-                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))
-                .map_err(cuda_err)?;
-            bufs.push((ptr, event));
-        }
-        Ok(PinnedRing { bufs, chunk_bytes, _ctx: ctx })
+        PinnedRing::new(&self.stream, chunk_bytes, depth)
     }
 
     /// Chunked upload through the ring: the host memcpy of chunk `i+1`
     /// overlaps the async DMA of chunk `i` (per-buffer events gate reuse).
     pub fn upload_pipelined(&self, bytes: &[u8], ring: &PinnedRing) -> Result<DeviceData> {
-        let mut dev = self.stream.alloc_zeros::<u8>(bytes.len() + 8).map_err(cuda_err)?;
-        {
-            let (dptr, _sync_on_drop) = dev.device_ptr_mut(&self.stream);
-            let depth = ring.bufs.len();
-            for (i, chunk) in bytes.chunks(ring.chunk_bytes).enumerate() {
-                let (ptr, event) = &ring.bufs[i % depth];
-                // Wait until the DMA that last read this buffer finished.
-                event.synchronize().map_err(cuda_err)?;
-                // Safety: buffer is chunk_bytes long; chunk fits by
-                // construction; no DMA in flight per the event sync.
-                let staged = unsafe {
-                    std::ptr::copy_nonoverlapping(chunk.as_ptr(), *ptr, chunk.len());
-                    std::slice::from_raw_parts(*ptr, chunk.len())
-                };
-                let off = (i * ring.chunk_bytes) as u64;
-                // Safety: dst range is within dev (len+8); staged is pinned
-                // and outlives the copy (event-gated).
-                unsafe { cu::memcpy_htod_async(dptr + off, staged, self.stream.cu_stream()) }
-                    .map_err(cuda_err)?;
-                event.record(&self.stream).map_err(cuda_err)?;
-            }
-        }
-        self.stream.synchronize().map_err(cuda_err)?;
+        let dev = ring.upload(&self.stream, bytes)?;
         Ok(DeviceData { dev, len: bytes.len() as u64 })
     }
 }
@@ -572,6 +540,75 @@ pub struct PinnedRing {
 // Safety: the raw pointers are exclusively owned page-locked allocations;
 // access is gated by CudaEvents.
 unsafe impl Send for PinnedRing {}
+
+impl PinnedRing {
+    /// See [`GpuDecoder::new_pinned_ring`] — stream-based so non-decoder
+    /// owners (e.g. the encode packer) can hold their own ring.
+    pub fn new(stream: &Arc<CudaStream>, chunk_bytes: usize, depth: usize) -> Result<Self> {
+        let ctx = stream.context().clone();
+        let mut bufs = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            // Safety: sized allocation, freed in Drop; flags=0 → cacheable.
+            let ptr = unsafe { cu::malloc_host(chunk_bytes, 0) }.map_err(cuda_err)? as *mut u8;
+            let event = ctx
+                .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))
+                .map_err(cuda_err)?;
+            bufs.push((ptr, event));
+        }
+        Ok(PinnedRing { bufs, chunk_bytes, _ctx: ctx })
+    }
+
+    /// Pipelined htod upload of `bytes` (+8 B zero tail slack): the host
+    /// memcpy of chunk `i+1` overlaps the async DMA of chunk `i`.
+    pub fn upload(
+        &self,
+        stream: &Arc<CudaStream>,
+        bytes: &[u8],
+    ) -> Result<cudarc::driver::CudaSlice<u8>> {
+        let mut dev = stream.alloc_zeros::<u8>(bytes.len() + 8).map_err(cuda_err)?;
+        {
+            let (dptr, _sync_on_drop) = dev.device_ptr_mut(stream);
+            // Safety: dst range is within dev (len + 8 slack).
+            unsafe { self.upload_into(stream, dptr, bytes)? };
+        }
+        stream.synchronize().map_err(cuda_err)?;
+        Ok(dev)
+    }
+
+    /// Pipelined htod of `bytes` to raw device address `dptr` (no alloc, no
+    /// final sync) — lets a caller pack several host slices into one device
+    /// buffer at offsets, e.g. Arrow batch chunks.
+    ///
+    /// # Safety
+    /// `dptr .. dptr + bytes.len()` must be a valid device range on
+    /// `stream`, and the caller must synchronize before reading it.
+    pub unsafe fn upload_into(
+        &self,
+        stream: &Arc<CudaStream>,
+        dptr: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let depth = self.bufs.len();
+        for (i, chunk) in bytes.chunks(self.chunk_bytes).enumerate() {
+            let (ptr, event) = &self.bufs[i % depth];
+            // Wait until the DMA that last read this buffer finished.
+            event.synchronize().map_err(cuda_err)?;
+            // Safety: buffer is chunk_bytes long; chunk fits by
+            // construction; no DMA in flight per the event sync.
+            let staged = unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), *ptr, chunk.len());
+                std::slice::from_raw_parts(*ptr, chunk.len())
+            };
+            let off = (i * self.chunk_bytes) as u64;
+            // Safety: dst validity is the caller's contract; staged is
+            // pinned and outlives the copy (event-gated).
+            unsafe { cu::memcpy_htod_async(dptr + off, staged, stream.cu_stream()) }
+                .map_err(cuda_err)?;
+            event.record(stream).map_err(cuda_err)?;
+        }
+        Ok(())
+    }
+}
 
 impl Drop for PinnedRing {
     fn drop(&mut self) {

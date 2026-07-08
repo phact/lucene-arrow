@@ -125,6 +125,11 @@ impl Encoder {
 /// Accumulated column data for the in-progress segment.
 enum ColBuffer {
     Numeric { docs: Vec<u32>, values: Vec<i64> },
+    /// Zero-copy lane for dense canonical Int64 (Passthrough, no nulls
+    /// seen): holds Arrow batch refs; values stream to the encoder as
+    /// chunk slices — no host materialization, no docs array. Demotes to
+    /// `Numeric` the moment a null appears.
+    NumericDense { chunks: Vec<arrow_array::ArrayRef>, len: usize },
     Vectors { docs: Vec<u32>, data: Vec<f32> },
     Sorted { docs: Vec<u32>, terms: Vec<Vec<u8>> },
     Bytes { docs: Vec<u32>, values: Vec<Vec<u8>> },
@@ -133,10 +138,13 @@ enum ColBuffer {
 }
 
 impl ColBuffer {
-    fn for_coercion(c: &NumericCoercion) -> ColBuffer {
+    /// `hint` = expected docs per segment (capped by the caller): fixed-
+    /// width buffers pre-reserve so a 16M-doc push doesn't pay repeated
+    /// grow-realloc-copy cycles (measured as most of the push cost).
+    fn for_coercion(c: &NumericCoercion, hint: usize) -> ColBuffer {
         match c {
             NumericCoercion::SortedUtf8 | NumericCoercion::SortedDict => {
-                ColBuffer::Sorted { docs: Vec::new(), terms: Vec::new() }
+                ColBuffer::Sorted { docs: Vec::with_capacity(hint), terms: Vec::new() }
             }
             NumericCoercion::Bytes => ColBuffer::Bytes { docs: Vec::new(), values: Vec::new() },
             NumericCoercion::MultiNumeric => {
@@ -146,13 +154,23 @@ impl ColBuffer {
                 ColBuffer::MultiTerms { docs: Vec::new(), terms: Vec::new() }
             }
             NumericCoercion::VectorF32 { .. } => {
-                ColBuffer::Vectors { docs: Vec::new(), data: Vec::new() }
+                ColBuffer::Vectors { docs: Vec::with_capacity(hint), data: Vec::new() }
             }
-            _ => ColBuffer::Numeric { docs: Vec::new(), values: Vec::new() },
+            NumericCoercion::Passthrough => {
+                ColBuffer::NumericDense { chunks: Vec::new(), len: 0 }
+            }
+            _ => ColBuffer::Numeric {
+                docs: Vec::with_capacity(hint),
+                values: Vec::with_capacity(hint),
+            },
         }
     }
     fn clear(&mut self) {
         match self {
+            ColBuffer::NumericDense { chunks, len } => {
+                chunks.clear();
+                *len = 0;
+            }
             ColBuffer::Numeric { docs, values } => {
                 docs.clear();
                 values.clear();
@@ -320,11 +338,15 @@ impl WriteSession {
         if fields.is_empty() {
             return Err(Error::invalid("write schema has no fields"));
         }
-        let buffers = fields.iter().map(|f| ColBuffer::for_coercion(&f.coercion)).collect();
+        let segment_max_docs = job.segment_max_docs.unwrap_or(DEFAULT_SEGMENT_MAX_DOCS).max(1);
+        // Reserve up to one segment of fixed-width buffer up front (capped
+        // so an unbounded segment_max_docs doesn't balloon the reserve).
+        let hint = segment_max_docs.min(16 << 20) as usize;
+        let buffers = fields.iter().map(|f| ColBuffer::for_coercion(&f.coercion, hint)).collect();
         Ok(WriteSession {
             out_dir,
             fields,
-            segment_max_docs: job.segment_max_docs.unwrap_or(DEFAULT_SEGMENT_MAX_DOCS).max(1),
+            segment_max_docs,
             buffers,
             docs_in_segment: 0,
             written: Vec::new(),
@@ -358,7 +380,9 @@ impl WriteSession {
         let name = format!("_{}", lucene_arrow_codec::liv::base36(self.written.len() as i64));
         let id = random_segment_id();
         let mut builder = DocValuesFileBuilder::new(&id, "Lucene90_0");
+        let field_timing = std::env::var_os("LA_TIMING").is_some();
         for (i, buf) in self.buffers.iter().enumerate() {
+            let t_field = std::time::Instant::now();
             match buf {
                 ColBuffer::Numeric { docs, values } => builder.add_numeric_with(
                     self.encoder.as_dyn(),
@@ -367,6 +391,19 @@ impl WriteSession {
                     values,
                     self.docs_in_segment,
                 )?,
+                ColBuffer::NumericDense { chunks, len } => {
+                    debug_assert_eq!(*len as u32, self.docs_in_segment);
+                    let slices: Vec<&[i64]> = chunks
+                        .iter()
+                        .map(|c| c.as_primitive::<Int64Type>().values().inner().typed_data())
+                        .collect();
+                    builder.add_numeric_dense_chunks(
+                        self.encoder.as_dyn(),
+                        i as i32,
+                        &slices,
+                        self.docs_in_segment,
+                    )?
+                }
                 ColBuffer::Sorted { docs, terms } => {
                     let refs: Vec<&[u8]> = terms.iter().map(|t| t.as_slice()).collect();
                     builder.add_sorted_with(
@@ -397,8 +434,16 @@ impl WriteSession {
                 )?,
                 ColBuffer::Vectors { .. } => {} // handled below (not doc values)
             }
+            if field_timing {
+                eprintln!("  [timing]   field {i}: {:8.3} s", t_field.elapsed().as_secs_f64());
+            }
         }
         let (dvm, dvd) = builder.finish();
+        let timing = std::env::var_os("LA_TIMING").is_some();
+        if timing {
+            eprintln!("  [timing] encode (buffers→dvd) : {:8.3} s", t.elapsed().as_secs_f64());
+        }
+        let t_files = std::time::Instant::now();
         let write_fields: Vec<WriteField> = self
             .fields
             .iter()
@@ -489,6 +534,10 @@ impl WriteSession {
             &extra_refs,
         )?;
 
+        if timing {
+            eprintln!("  [timing] segment files (IO)   : {:8.3} s", t_files.elapsed().as_secs_f64());
+        }
+        let t_crc = std::time::Instant::now();
         let files = seg
             .files
             .iter()
@@ -545,6 +594,9 @@ impl WriteSession {
                 .collect(),
             wall_ms: t.elapsed().as_millis() as u64,
         });
+        if timing {
+            eprintln!("  [timing] manifest CRC         : {:8.3} s", t_crc.elapsed().as_secs_f64());
+        }
         self.written.push(seg);
         self.docs_in_segment = 0;
         for buf in &mut self.buffers {
@@ -570,6 +622,30 @@ fn append_column(
     doc_base: u32,
     buffer: &mut ColBuffer,
 ) -> Result<()> {
+    if let ColBuffer::NumericDense { chunks, len } = buffer {
+        let a = col.as_primitive::<Int64Type>();
+        if a.null_count() == 0 {
+            chunks.push(col.clone());
+            *len += a.len();
+            return Ok(());
+        }
+        // A null arrived: demote to the materialized lane (docs + values),
+        // replaying the chunks accumulated so far, then fall through.
+        let mut docs: Vec<u32> = Vec::with_capacity(*len + a.len());
+        let mut values: Vec<i64> = Vec::with_capacity(*len + a.len());
+        docs.extend(0..*len as u32);
+        for c in chunks.iter() {
+            values.extend_from_slice(c.as_primitive::<Int64Type>().values());
+        }
+        for i in 0..a.len() {
+            if a.is_valid(i) {
+                docs.push(doc_base + i as u32);
+                values.push(a.value(i));
+            }
+        }
+        *buffer = ColBuffer::Numeric { docs, values };
+        return Ok(());
+    }
     if let ColBuffer::Vectors { docs, data } = buffer {
         let NumericCoercion::VectorF32 { dim, .. } = coercion else {
             return Err(Error::invalid("vector buffer without vector coercion"));

@@ -289,3 +289,35 @@ fn gpu_encoder_files_match_cpu_files() {
         assert_eq!(a.data, b.data, "{label}: .dvd payload differs");
     }
 }
+
+/// Zero-copy lane differential: dense-chunked encode on the GPU packer ==
+/// flat encode on the CPU reference, whole field bytes (meta + data).
+#[test]
+fn chunked_dense_encode_matches_cpu_flat() {
+    let Ok(gpu) = lucene_arrow_gpu::GpuDecoder::new() else { return };
+    let packer = lucene_arrow_gpu::encode::GpuPacker::new(&gpu).unwrap();
+    use lucene_arrow_docvalues::write::{
+        CpuEncoder, encode_numeric_field_dense_chunks, encode_numeric_field_with,
+    };
+    let cases: Vec<Vec<i64>> = vec![
+        (0..100_000).map(|i| 1_000_000 + (i % 4096) * 25).collect(), // gcd
+        (0..80_000).map(|i| (i as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64)).collect(), // 64bpv, neg min
+        (0..50_000).map(|i| (i % 5) * 7).collect(),                  // table
+        (0..65_536).map(|i| i & 0xFFFFF).collect(),                  // 20-bit
+    ];
+    for (ci, values) in cases.iter().enumerate() {
+        let n = values.len() as u32;
+        let docs: Vec<u32> = (0..n).collect();
+        let cpu = encode_numeric_field_with(&CpuEncoder, 3, &docs, values, n, 999).unwrap();
+        // uneven chunk splits, including a 1-element chunk
+        let s1 = 1usize;
+        let s2 = values.len() / 3;
+        let chunks: Vec<&[i64]> =
+            vec![&values[..s1], &values[s1..s1 + s2], &values[s1 + s2..]];
+        let gpu_enc =
+            encode_numeric_field_dense_chunks(&packer, 3, &chunks, n, 999).unwrap();
+        assert_eq!(cpu.meta, gpu_enc.meta, "case {ci}: dvm mismatch");
+        assert_eq!(cpu.data, gpu_enc.data, "case {ci}: dvd mismatch");
+    }
+    eprintln!("gpu chunked dense encode == cpu flat for {} cases", cases.len());
+}

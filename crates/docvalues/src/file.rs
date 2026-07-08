@@ -68,6 +68,27 @@ impl DocValuesFileBuilder {
         Ok(())
     }
 
+    /// Append one **dense** NUMERIC field straight from Arrow batch
+    /// slices — the zero-copy ingest lane (no docs array, no host concat).
+    pub fn add_numeric_dense_chunks(
+        &mut self,
+        encoder: &dyn NumericEncoder,
+        field_number: i32,
+        chunks: &[&[i64]],
+        max_doc: u32,
+    ) -> Result<()> {
+        let encoded = crate::write::encode_numeric_field_dense_chunks(
+            encoder,
+            field_number,
+            chunks,
+            max_doc,
+            self.dvd.len() as u64,
+        )?;
+        self.dvm.extend_from_slice(&encoded.meta);
+        self.dvd.extend_from_slice(&encoded.data);
+        Ok(())
+    }
+
     /// Append one SORTED field (single term per doc-with-value).
     pub fn add_sorted_with(
         &mut self,

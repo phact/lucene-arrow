@@ -147,7 +147,7 @@ fill in when available; `QUICK=1` for a fast smoke run).
 |---|---|---|---|---|
 | doc-values **read**, e2e (device-resident Arrow out) | 4,006 Mvals/s | 316 Mvals/s | **12.7×** | `--bench e2e_decode` / `BenchScan` |
 | doc-values read, GPU kernels only | 48.7 Gvals/s | — | 154× | `--bench gpu_decode` |
-| doc-values **write** (DoPut, GPU stats+pack) | 26.0 Mdocs/s | 4.09 Mdocs/s | **6.4×** | `--bench write_bench` / `BenchIngest` |
+| doc-values **write** (DoPut, GPU stats+pack, zero-copy dense lane) | 26.1 Mdocs/s | 4.09 Mdocs/s | **6.4×** | `--bench write_bench` / `BenchIngest` |
 | **HNSW indexing** (200k×128, graph + segment) | 1.06 s | 9.49 s | **9.0×** | `--bench hnsw_build` / `BenchKnnIngest` |
 | **postings scan** (12M postings, same checksum) | 462 Mpostings/s | 360 Mpostings/s | 1.27× | `--bench csr_bench` / `BenchText scan` |
 | postings decode, GPU doc-block kernel | 37 Gdocs/s | — | ~100× | `--bench postings_gpu` |

@@ -71,6 +71,27 @@ hit 52–151 Gval/s (37–186× single-thread CPU), byte-identical to
 isolation but DoPut is ingest-bound (Arrow append + file IO), so
 end-to-end write stays at 6.4× until the batch→buffer path goes zero-copy.
 
+**Zero-copy dense lane (register #6 follow-up, done).** `LA_TIMING=1`
+splits the write into push (Arrow→buffers) / encode / file-IO / CRC. On
+the 16M×4 bench, same-day baseline → after: GPU 20.8 → **26.1 Mdocs/s**
+(+26%), CPU 19.4 → **23.1** (+19%). What landed: (1) dense canonical
+Int64 columns now stay as **Arrow chunk refs** (`ColBuffer::NumericDense`)
+— no host values copy, no docs array; the encoder consumes chunk slices
+via new `stats_chunks`/`pack_chunks` trait methods (CPU streams the fold;
+GPU DMAs each chunk through the pinned ring into one device buffer), and
+a null demotes the column to the materialized lane; (2) `GpuPacker`
+uploads through the pinned ring instead of pageable htod; (3) bpv=64/
+gcd=1 pack is computed as the one-pass `(v−base)` host transform instead
+of an upload + kernel + 8 B/value download; (4) `words_to_payload` bulk
+memcpy instead of a per-word `to_le_bytes` loop; (5) push buffers
+pre-reserve a segment. Byte-identity gated three ways: docvalues
+`chunked_identity` (flat == chunked, CPU), differential
+`chunked_dense_encode_matches_cpu_flat` (GPU chunked == CPU flat, whole
+field bytes), and the whole-file encoder differential unchanged.
+Remaining split (GPU): push 0.19 s (sparse field's per-value loop) │
+encode 0.27 s (f2 stats + table atomics) │ files 0.05 s — next levers are
+per-field parallel encode and the sparse lane, diminishing vs done.
+
 ---
 
 ## P6 — cuVS + GPU-built vector segments
