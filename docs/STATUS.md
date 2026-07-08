@@ -290,13 +290,32 @@ scoring for every hit (1e-4; `p9_bm25_gpu.rs`). 256 3-term OR-queries,
 | heavy (top-500-df, ~65k rows/query) | 4.3k qps | **5.5k qps**, 379 Mrows/s |
 
 GPU qps is flat w.r.t. query weight (fixed ~180 µs/query overhead); JVM
-degrades 4.5×. Exhaustive GPU scoring wins the analytics shape (heavy
-terms, full-corpus ranking, score-everything joins); Lucene's
-impact-skipping wins selective top-k — recorded as executor policy.
-Headroom not yet taken: query batching into one launch (fills GPU
-occupancy — a single query barely occupies the 5090), device-side top-k,
-pinned score buffers. Float atomicAdd makes exact tie order
-nondeterministic (scores still match to 1e-4).
+degrades 4.5×. Float atomicAdd makes exact tie order nondeterministic
+(scores still match to 1e-4).
+
+**Query batching — the headroom, taken.** `Bm25Scorer::score_batch`
+scores the whole query set in ONE launch (grid.y = query, scores into a
+`nq × num_docs` matrix) and a second kernel selects each query's top-k
+on the device (one block/query: per-thread insertion top-k → shared-mem
+parallel argmax rounds), so the download is k pairs per query instead of
+a dense float row + host argmax. The per-query fixed floor (launch +
+sync + 1.2 MB D2H + host scan) was the whole story; the math never was.
+Measured, 300k docs, 256 3-term OR queries, top-10, fresh JVM baseline
+on the same corpus + query files:
+
+| set | per-query GPU | **batched GPU** | JVM | batched vs JVM |
+|---|---|---|---|---|
+| selective | 5.3k qps | **211k qps** | 18.1k qps | **12×** |
+| heavy | 5.1k qps (352 Mrows/s) | **117k qps (8.1 Grows/s)** | 4.4k qps | **27×** |
+
+This flips the one workload Lucene's impact-skipping used to win
+(selective, was 0.24×). Executor-policy note stands for *latency-bound
+single queries* (a lone query still pays the launch floor); for anything
+that can batch — analytics, reranking, eval sweeps — the GPU wins both
+shapes decisively. Gate: `p9_bm25_gpu` asserts batch top-k == dense
+scores rank-by-rank (single- and multi-term, multi-query) and dense ==
+live Java. Batch memory is `nq × num_docs × 4` B (307 MB here); chunk
+the batch when that outgrows VRAM.
 
 ---
 

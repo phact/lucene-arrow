@@ -69,6 +69,61 @@ fn gpu_bm25_matches_java_scoring() {
     let scores =
         scorer.score(&gpu, &d_docs, &d_freqs, &d_norms, &terms, num_docs, avgdl).unwrap();
 
+    // Batched path + device top-k must agree with the dense single-query
+    // path (which the Java gate below verifies): same top-k docs, scores
+    // to atomicAdd tolerance.
+    let k = 10usize.min(docs_g.len());
+    let batch = scorer
+        .score_batch(&gpu, &d_docs, &d_freqs, &d_norms, &[terms.to_vec()], num_docs, avgdl, k)
+        .unwrap();
+    let mut host_top: Vec<(u32, f32)> =
+        scores.iter().enumerate().map(|(d, &s)| (d as u32, s)).collect();
+    host_top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    host_top.truncate(k);
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].len(), k);
+    for (i, &(bd, bs)) in batch[0].iter().enumerate() {
+        let (hd, hs) = host_top[i];
+        assert!(
+            (bs - hs).abs() < 1e-4 * hs.abs().max(1e-6),
+            "top-{i}: batch ({bd},{bs}) vs host ({hd},{hs})"
+        );
+    }
+    eprintln!("batched top-{k} == dense top-{k}");
+
+    // Multi-query batch: every query's device top-k scores must match a
+    // host top-k over that query's dense scores (rank-by-rank, tolerant to
+    // atomicAdd order; doc ids may differ only on ties).
+    let mk = |name: &[u8]| -> QueryTerm {
+        let t = (0..inv.num_terms()).find(|&t| inv.term(t) == name).unwrap();
+        let df = (inv.row_offsets[t + 1] - inv.row_offsets[t]) as f32;
+        QueryTerm {
+            row_start: inv.row_offsets[t],
+            row_end: inv.row_offsets[t + 1],
+            idf: (1.0 + (num_docs as f32 - df + 0.5) / (df + 0.5)).ln(),
+            _pad: 0.0,
+        }
+    };
+    let multi: Vec<Vec<QueryTerm>> =
+        vec![vec![mk(b"gamma")], vec![mk(b"alpha"), mk(b"beta")], vec![mk(b"common"), mk(b"gamma")]];
+    let got = scorer
+        .score_batch(&gpu, &d_docs, &d_freqs, &d_norms, &multi, num_docs, avgdl, 5)
+        .unwrap();
+    for (qi, q) in multi.iter().enumerate() {
+        let dense =
+            scorer.score(&gpu, &d_docs, &d_freqs, &d_norms, q, num_docs, avgdl).unwrap();
+        let mut top: Vec<f32> = dense.to_vec();
+        top.sort_by(|a, b| b.total_cmp(a));
+        for (i, &(_, bs)) in got[qi].iter().enumerate() {
+            assert!(
+                (bs - top[i]).abs() < 1e-4 * top[i].abs().max(1e-6),
+                "q{qi} rank {i}: batch {bs} vs dense {}",
+                top[i]
+            );
+        }
+    }
+    eprintln!("multi-query batch matches dense per-query scores rank-by-rank");
+
     // Java scores for the same term over the same segment.
     let java = std::path::Path::new("/home/tato/.jbang/cache/jdks/21/bin/java");
     let harness = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../harness");

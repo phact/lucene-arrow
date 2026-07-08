@@ -153,6 +153,6 @@ fill in when available; `QUICK=1` for a fast smoke run).
 | postings decode, GPU doc-block kernel | 37 Gdocs/s | — | ~100× | `--bench postings_gpu` |
 | **BM25 ingest** (arXiv markdown, 46 MB), CPU | 227 MB/s | 35 MB/s | **6.5×** | `--bench bm25_ingest` / `BenchMdIngest` |
 | BM25 ingest, GPU tokenize (full job) | ~138 ms | 1.33 s | **~9.6×** | `--bench gpu_ingest` |
-| **BM25 scoring**, heavy queries | 5.5k qps (379 Mrows/s) | 4.3k qps | 1.27× | `--bench bm25_query` / `BenchBM25Query` |
-| BM25 scoring, selective queries | 4.8k qps | 19.6k qps | 0.24× | `--bench bm25_query` |
+| **BM25 scoring**, heavy queries (batched, device top-10) | 117k qps (8.1 Grows/s) | 4.4k qps | **27×** | `--bench bm25_query` / `BenchBM25Query` |
+| BM25 scoring, selective queries (batched) | 211k qps | 18.1k qps | **12×** | `--bench bm25_query` |
 | vector rebuild-merge, fused GPU **extract** (2M×1536) | 15 GB/s | 3.1 GB/s (CPU) | **4.8×** | `--example jvector_merge_scale` |

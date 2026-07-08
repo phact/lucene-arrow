@@ -89,5 +89,22 @@ fn main() {
             rows as f64 / secs / 1e6
         );
     }
+    // Batched: all queries in ONE launch + device top-10 (the shape that
+    // actually fills the GPU — per-query launches pay a fixed floor).
+    let batch: Vec<Vec<QueryTerm>> = queries.iter().map(make_terms).collect();
+    let rows: u64 = batch.iter().flatten().map(|t| t.row_end - t.row_start).sum();
+    for round in 0..3 {
+        let t0 = Instant::now();
+        let top =
+            scorer.score_batch(&gpu, &d, &f, &n, &batch, num_docs, avgdl, 10).unwrap();
+        let secs = t0.elapsed().as_secs_f64();
+        let top1: u32 = top.iter().map(|t| t[0].0).fold(0, |a, d| a ^ d);
+        println!(
+            "{setname} BATCHED round {round}: {nq} queries in {:.3} s = {:.0} qps, {:.1} Mrows/s scored (x{top1})",
+            secs,
+            nq as f64 / secs,
+            rows as f64 / secs / 1e6
+        );
+    }
     }
 }
